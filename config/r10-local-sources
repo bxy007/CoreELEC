@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Sourced inside source_package; enabled only by the R10 build wrapper.
+
+[ "${PROJECT}/${DEVICE}" = "Amlogic-ce/Amlogic-ng" ] || die "R10 local sources require Amlogic-ce/Amlogic-ng"
+[ -n "${R10_LOCAL_STATE_DIR}" ] || die "Run R10/build.sh to prepare local source stamps"
+
+local r10_pkg r10_repo r10_recipe r10_stamp
+while read -r r10_pkg r10_repo r10_recipe; do
+  r10_stamp="${R10_LOCAL_STATE_DIR}/${r10_pkg}.sha256"
+  if [ "${PKG_NAME}" = "${r10_pkg}" ]; then
+    [ -d "${R10_LOCAL_SOURCES_DIR}/${r10_repo}" ] || die "Missing local source: ${r10_repo}"
+    [ -s "${r10_stamp}" ] || die "Missing source stamp; run R10/build.sh prepare"
+    PKG_URL="file://${R10_LOCAL_SOURCES_DIR}/${r10_repo}"
+    unset PKG_SOURCE_NAME PKG_SOURCE_DIR
+    PKG_SHA256=""
+    GET_HANDLER_SUPPORT="archive file"
+    PKG_NEED_UNPACK+=" ${r10_stamp} ${ROOT}/config/r10-local-sources"
+  else
+    # Include local content in stamps of consumers such as kernel drivers and
+    # Kodi's native build tools, whose recipes already depend on these paths.
+    case " ${PKG_NEED_UNPACK} " in
+      *" ${ROOT}/${r10_recipe} "*) PKG_NEED_UNPACK+=" ${r10_stamp}" ;;
+    esac
+  fi
+done <<'R10_SOURCES'
+linux linux-amlogic projects/Amlogic-ce/packages/linux
+kodi xbmc projects/Amlogic-ce/packages/mediacenter/kodi
+media_modules-aml media_modules-aml projects/Amlogic-ce/packages/linux-drivers/amlogic/media_modules-aml
+CoreELEC-settings service.coreelec.settings projects/Amlogic-ce/packages/mediacenter/CoreELEC-settings
+kodi-theme-avdvplus.estuary skin.avdvplus.estuary packages/mediacenter/kodi-theme-avdvplus.estuary
+R10_SOURCES

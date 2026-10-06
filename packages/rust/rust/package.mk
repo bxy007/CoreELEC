@@ -7,12 +7,10 @@ PKG_SHA256="4c142a625f12e3cdf716c68ae19f4f60d98ad1482627b08579b15838e95ad514"
 PKG_LICENSE="MIT"
 PKG_SITE="https://www.rust-lang.org"
 PKG_URL="https://static.rust-lang.org/dist/rustc-${PKG_VERSION}-src.tar.gz"
-LLVM_CI_DOWNLOAD="${LLVM_CI_DOWNLOAD:-yes}"
-if [ "${LLVM_CI_DOWNLOAD}" = "yes" ]; then
-  PKG_DEPENDS_HOST="toolchain"
-else
-  PKG_DEPENDS_HOST="toolchain llvm:host"
-fi
+# CI artifacts for this release are no longer available. Build the LLVM bundled
+# with Rust: the standalone LLVM 19 recipe is too old for Rust 1.94 (needs >=20).
+LLVM_CI_DOWNLOAD="${LLVM_CI_DOWNLOAD:-no}"
+PKG_DEPENDS_HOST="toolchain"
 PKG_DEPENDS_UNPACK="rustc-snapshot rust-std-snapshot cargo-snapshot"
 PKG_LONGDESC="A systems programming language that prevents segfaults, and guarantees thread safety."
 PKG_TOOLCHAIN="manual"
@@ -48,14 +46,13 @@ change-id = 148671
 
 [llvm]
 download-ci-llvm = $([ "${LLVM_CI_DOWNLOAD}" = "yes" ] && echo "true" || echo "false")
+$([ "${LLVM_CI_DOWNLOAD}" != "yes" ] && printf 'targets = "X86;ARM;AArch64"\nlink-jobs = 2')
 
 [target.${TARGET_NAME}]
-$([ "${LLVM_CI_DOWNLOAD}" != "yes" ] && echo "llvm-config = \"${TOOLCHAIN}/bin/llvm-config\"")
 cxx = "${_TARGET_CXX}"
 cc = "${_TARGET_CC}"
 
 [target.${RUST_HOST}]
-$([ "${LLVM_CI_DOWNLOAD}" != "yes" ] && echo "llvm-config = \"${TOOLCHAIN}/bin/llvm-config\"")
 cxx = "${_HOST_CXX}"
 cc = "${_HOST_CC}"
 
