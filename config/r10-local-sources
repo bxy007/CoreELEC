@@ -28,4 +28,5 @@ kodi xbmc projects/Amlogic-ce/packages/mediacenter/kodi
 media_modules-aml media_modules-aml projects/Amlogic-ce/packages/linux-drivers/amlogic/media_modules-aml
 CoreELEC-settings service.coreelec.settings projects/Amlogic-ce/packages/mediacenter/CoreELEC-settings
 kodi-theme-avdvplus.estuary skin.avdvplus.estuary packages/mediacenter/kodi-theme-avdvplus.estuary
+kodi-language-zh_cn resource.language.zh_cn projects/Amlogic-ce/packages/mediacenter/kodi-language-zh_cn
 R10_SOURCES
