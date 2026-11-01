@@ -1,0 +1,36 @@
+From: CoreELEC local fixes
+Subject: [PATCH] adapter: check kernel command support before resetting monitors
+
+Older kernels support LE advertising without Advertisement Monitor commands.
+Use Read Commands instead of assuming that Remove Monitor is implemented.
+
+--- a/src/adapter.c
++++ b/src/adapter.c
+@@ -151,6 +151,7 @@
+ static DBusConnection *dbus_conn = NULL;
+ 
+ static uint32_t kernel_features = 0;
++static bool remove_adv_monitor_supported;
+ 
+ static GList *adapter_list = NULL;
+ static unsigned int adapter_remaining = 0;
+@@ -10456,6 +10457,9 @@
+ {
+ 	struct mgmt_cp_remove_adv_monitor cp;
+ 
++	if (!remove_adv_monitor_supported)
++		return;
++
+ 	DBG("sending remove Adv Monitor command with handle 0");
+ 
+ 	/* Handle 0 indicates to remove all */
+@@ -10654,6 +10658,9 @@
+ 		uint16_t op = get_le16(rp->opcodes + i);
+ 
+ 		switch (op) {
++		case MGMT_OP_REMOVE_ADV_MONITOR:
++			remove_adv_monitor_supported = true;
++			break;
+ 		case MGMT_OP_ADD_DEVICE:
+ 			DBG("enabling kernel-side connection control");
+ 			kernel_features |= KERNEL_CONN_CONTROL;
