@@ -1,0 +1,144 @@
+From: CoreELEC local fixes
+Subject: [PATCH] Share GIL handoff requests across Python 3.11 interpreters
+
+Python 3.11 shares one GIL but signals the waiting interpreter's drop flag.
+A CPU-bound peer interpreter may never observe that request. CPython 3.13
+addresses this with per-thread eval breakers (gh-112175, commit 0749244d).
+
+Adapt the handoff behavior to 3.11 without moving thread-state fields or
+reading last_holder->interp: PyThreadState_Swap/Py_EndInterpreter in 3.11
+can leave that historical pointer dangling while the GIL is still held.
+Use one atomic handoff request, checked alongside the existing local eval
+breaker. Keep signals, pending calls and async exceptions interpreter-local,
+and retain all existing structure layouts and the original GIL mutexes.
+Clear the shared request when creating/recreating the GIL.
+
+This is a 3.11 shared-GIL adaptation, not a cherry-pick of the 3.13 refactor.
+It adds one atomic load at eval-breaker checkpoints. The unused per-interpreter
+gil_drop_request field is retained for layout compatibility.
+
+Reference: https://github.com/python/cpython/commit/0749244d13412d7cb5b53d834f586f2198f5b9a6
+
+--- a/Python/ceval.c
++++ b/Python/ceval.c
+@@ -217,17 +217,26 @@
+     " value in enclosing scope"
+ 
+ 
+-/* This can set eval_breaker to 0 even though gil_drop_request became
+-   1.  We believe this is all right because the eval loop will release
+-   the GIL eventually anyway. */
++/* All 3.11 interpreters share one GIL. Keep its handoff request shared too.
++   Unlike 3.13, 3.11 may swap or delete a thread state while retaining the GIL,
++   so last_holder cannot safely be dereferenced by a waiting thread.
++   Check this flag alongside the interpreter-local eval breaker; pending
++   calls, signals and async exceptions retain their existing ownership. */
++static _Py_atomic_int gil_drop_request = {0};
++
++static inline int
++EVAL_BREAKER_IS_SET(_Py_atomic_int *eval_breaker)
++{
++    return _Py_atomic_load_relaxed_int32(eval_breaker)
++           | _Py_atomic_load_relaxed_int32(&gil_drop_request);
++}
+ static inline void
+ COMPUTE_EVAL_BREAKER(PyInterpreterState *interp,
+                      struct _ceval_runtime_state *ceval,
+                      struct _ceval_state *ceval2)
+ {
+     _Py_atomic_store_relaxed(&ceval2->eval_breaker,
+-        _Py_atomic_load_relaxed_int32(&ceval2->gil_drop_request)
+-        | (_Py_atomic_load_relaxed_int32(&ceval->signals_pending)
++        (_Py_atomic_load_relaxed_int32(&ceval->signals_pending)
+            && _Py_ThreadCanHandleSignals(interp))
+         | (_Py_atomic_load_relaxed_int32(&ceval2->pending.calls_to_do)
+            && _Py_ThreadCanHandlePendingCalls())
+@@ -236,11 +245,9 @@
+ 
+ 
+ static inline void
+-SET_GIL_DROP_REQUEST(PyInterpreterState *interp)
+-{
+-    struct _ceval_state *ceval2 = &interp->ceval;
+-    _Py_atomic_store_relaxed(&ceval2->gil_drop_request, 1);
+-    _Py_atomic_store_relaxed(&ceval2->eval_breaker, 1);
++SET_GIL_DROP_REQUEST(void)
++{
++    _Py_atomic_store_relaxed(&gil_drop_request, 1);
+ }
+ 
+ 
+@@ -249,7 +256,7 @@
+ {
+     struct _ceval_runtime_state *ceval = &interp->runtime->ceval;
+     struct _ceval_state *ceval2 = &interp->ceval;
+-    _Py_atomic_store_relaxed(&ceval2->gil_drop_request, 0);
++    _Py_atomic_store_relaxed(&gil_drop_request, 0);
+     COMPUTE_EVAL_BREAKER(interp, ceval, ceval2);
+ }
+ 
+@@ -1193,7 +1200,7 @@
+     }
+ 
+     /* GIL drop request */
+-    if (_Py_atomic_load_relaxed_int32(&ceval2->gil_drop_request)) {
++    if (_Py_atomic_load_relaxed_int32(&gil_drop_request)) {
+         /* Give another thread a chance */
+         if (_PyThreadState_Swap(&runtime->gilstate, NULL) != tstate) {
+             Py_FatalError("tstate mix-up");
+@@ -1342,7 +1349,7 @@
+ 
+ #define CHECK_EVAL_BREAKER() \
+     _Py_CHECK_EMSCRIPTEN_SIGNALS_PERIODICALLY(); \
+-    if (_Py_atomic_load_relaxed_int32(eval_breaker)) { \
++    if (EVAL_BREAKER_IS_SET(eval_breaker)) { \
+         goto handle_eval_breaker; \
+     }
+ 
+@@ -1776,7 +1783,7 @@
+             PREDICTED(RESUME_QUICK);
+             assert(tstate->cframe == &cframe);
+             assert(frame == cframe.current_frame);
+-            if (_Py_atomic_load_relaxed_int32(eval_breaker) && oparg < 2) {
++            if (EVAL_BREAKER_IS_SET(eval_breaker) && oparg < 2) {
+                 goto handle_eval_breaker;
+             }
+             DISPATCH();
+--- a/Python/ceval_gil.h
++++ b/Python/ceval_gil.h
+@@ -104,6 +104,8 @@
+ 
+ static void create_gil(struct _gil_runtime_state *gil)
+ {
++    /* Also discard requests from vanished threads after fork/re-init. */
++    _Py_atomic_store_relaxed(&gil_drop_request, 0);
+     MUTEX_INIT(gil->mutex);
+ #ifdef FORCE_SWITCHING
+     MUTEX_INIT(gil->switch_mutex);
+@@ -166,7 +168,7 @@
+     MUTEX_UNLOCK(gil->mutex);
+ 
+ #ifdef FORCE_SWITCHING
+-    if (_Py_atomic_load_relaxed(&ceval2->gil_drop_request) && tstate != NULL) {
++    if (_Py_atomic_load_relaxed(&gil_drop_request) && tstate != NULL) {
+         MUTEX_LOCK(gil->switch_mutex);
+         /* Not switched yet => wait */
+         if (((PyThreadState*)_Py_atomic_load_relaxed(&gil->last_holder)) == tstate)
+@@ -251,7 +253,7 @@
+             }
+             assert(_PyThreadState_CheckConsistency(tstate));
+ 
+-            SET_GIL_DROP_REQUEST(interp);
++            SET_GIL_DROP_REQUEST();
+             drop_requested = 1;
+         }
+     }
+@@ -290,7 +292,7 @@
+     }
+     assert(_PyThreadState_CheckConsistency(tstate));
+ 
+-    if (_Py_atomic_load_relaxed(&ceval2->gil_drop_request)) {
++    if (_Py_atomic_load_relaxed(&gil_drop_request)) {
+         RESET_GIL_DROP_REQUEST(interp);
+     }
+     else {
