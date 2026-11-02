@@ -1,0 +1,43 @@
+Subject: [PATCH] Reset H5 controllers after the kernel UART handover
+
+The loader resets after firmware download, then hands the UART to the kernel
+which establishes its own H5 link. With the legacy reset-on-close default,
+that handover is not followed by a kernel initialization reset.
+
+On RTL8852BS, fresh controller initialization repeatedly broke CMCC directed
+LE reconnects with the saved bonds and resolving list intact. A normal adapter
+power cycle restored them. The same loader binary with reset-on-init enabled,
+disabled and enabled again produced working, failing and working reconnects;
+B25 reconnects also passed. Request the existing UART reset-on-init flag for
+H5 so the normal kernel initialization sequence starts from a reset controller.
+
+This is a transport initialization change, not a per-remote reconnect retry.
+No device names, addresses, keys, sleeps or background reset services are added.
+
+--- a/hciattach.h
++++ b/hciattach.h
+@@ -55,6 +55,7 @@
+ #define HCI_UART_H4DS	3
+ #define HCI_UART_LL	4
+ #define HCI_UART_RAW_DEVICE	0
++#define HCI_UART_RESET_ON_INIT	1
+ 
+ extern uint8_t DBG_ON;
+ 
+--- a/hciattach.c
++++ b/hciattach.c
+@@ -227,6 +227,14 @@
+ 	if (raw)
+ 		flags |= 1 << HCI_UART_RAW_DEVICE;
+ 
++	/* The download-time reset precedes the kernel's H5 link setup.
++	 * Let the kernel reset the controller after taking over the UART,
++	 * before programming its runtime state. The legacy UART default
++	 * otherwise defers this reset until the first close.
++	 */
++	if (u->proto == HCI_UART_3WIRE)
++		flags |= 1 << HCI_UART_RESET_ON_INIT;
++
+ 	fd = open(dev, O_RDWR | O_NOCTTY);
+ 	if (fd < 0) {
+ 		RS_ERR("Can't open serial port, %d, %s", errno,
