@@ -396,7 +396,14 @@ if [ "${1}" = "release" -o "${1}" = "mkimage" -o "${1}" = "noobs" ]; then
       done
     else
       [ "${PROJECT}" = "Amlogic-ce" ] && SUBDEVICES+=" Generic"
-      for SUBDEVICE in ${SUBDEVICES}; do
+      IMAGE_SUBDEVICES="${SUBDEVICES}"
+      # Limit disk images only; retain all bootloader files in the release tar.
+      if [ "${PROJECT}" = "Amlogic-ce" ] &&
+         [ "${DEVICE}" = "Amlogic-ng" ] &&
+         [ "${R10_GENERIC_IMAGE_ONLY:-no}" = "yes" ]; then
+        IMAGE_SUBDEVICES="Generic"
+      fi
+      for SUBDEVICE in ${IMAGE_SUBDEVICES}; do
         do_mkimage "${IMAGE_NAME}"
       done
     fi
