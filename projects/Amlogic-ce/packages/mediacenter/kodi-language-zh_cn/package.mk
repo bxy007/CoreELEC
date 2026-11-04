@@ -8,7 +8,7 @@ PKG_SITE="https://github.com/xbmc/repo-resources/tree/omega/resource.language.zh
 PKG_URL="https://mirrors.kodi.tv/addons/omega/resource.language.zh_cn/resource.language.zh_cn-${PKG_VERSION}.zip"
 PKG_SOURCE_DIR="resource.language.zh_cn"
 PKG_DEPENDS_TARGET="toolchain"
-PKG_LONGDESC="Simplified Chinese language pack. The R10 build uses the local resource.language.zh_cn repository, based on Kodi Omega 11.0.104 with addon version 11.0.109."
+PKG_LONGDESC="Simplified Chinese language pack. The R10 build uses the local resource.language.zh_cn repository, based on Kodi Omega 11.0.104 with addon version 11.0.110."
 PKG_TOOLCHAIN="manual"
 
 makeinstall_target() {
