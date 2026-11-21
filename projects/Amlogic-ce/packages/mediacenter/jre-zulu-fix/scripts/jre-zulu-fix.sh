@@ -4,6 +4,12 @@
 JRE="/storage/.kodi/addons/tools.jre.zulu/jre"
 ADDON="/storage/.kodi/addons/tools.jre.zulu"
 SHIPPED_JARS="/usr/share/coreelec/bdj"
+BDJ_TMPDIR="/storage/.kodi/userdata/addon_data/tools.jre.zulu"
+
+# Ensure the java.io.tmpdir configured in libbluray exists even when using the built-in JRE
+# without tools.jre.zulu installed, and clear stale BD-J cache before Kodi starts.
+mkdir -p "$BDJ_TMPDIR" 2>/dev/null
+rm -rf "$BDJ_TMPDIR/libbluray-bdj-cache" 2>/dev/null
 
 [ -d "$JRE" ] || exit 0
 

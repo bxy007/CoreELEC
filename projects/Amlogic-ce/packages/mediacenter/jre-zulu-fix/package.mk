@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 PKG_NAME="jre-zulu-fix"
-PKG_VERSION="1"
+PKG_VERSION="2"
 PKG_LICENSE="GPL"
 PKG_SITE=""
 PKG_URL=""
