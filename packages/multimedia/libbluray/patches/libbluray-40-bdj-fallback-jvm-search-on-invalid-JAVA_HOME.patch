@@ -1,0 +1,31 @@
+From: forbxy <forbxy@github.com>
+Subject: [PATCH] bdj: fall back to default JVM search on invalid JAVA_HOME
+
+If JAVA_HOME points to a removed or broken addon directory (for example
+after uninstalling tools.jre.zulu without restarting Kodi), fall back to
+the pre-defined system JVM paths (including /usr/lib/jvm/jre) instead of
+failing immediately.
+---
+ src/libbluray/bdj/bdj.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/libbluray/bdj/bdj.c b/src/libbluray/bdj/bdj.c
+index 359bc8f..c9b4d12 100644
+--- a/src/libbluray/bdj/bdj.c
++++ b/src/libbluray/bdj/bdj.c
+@@ -455,8 +455,13 @@ static void *_load_jvm(const char **p_java_home, const char *app_java_home)
+     java_home = getenv("JAVA_HOME");
+     if (java_home) {
+         BD_DEBUG(DBG_BDJ, "Using JAVA_HOME '%s'\n", java_home);
+-        *p_java_home = java_home;
+-        return _jvm_dlopen_a(java_home, jvm_dir, num_jvm_dir, jvm_lib);
++        handle = _jvm_dlopen_a(java_home, jvm_dir, num_jvm_dir, jvm_lib);
++        if (handle) {
++            *p_java_home = java_home;
++            return handle;
++        }
++        BD_DEBUG(DBG_BDJ | DBG_CRIT,
++                 "invalid JAVA_HOME '%s', falling back to default search\n", java_home);
+     }
+ 
+ #if defined(_WIN32) && !defined(HAVE_BDJ_J2ME)

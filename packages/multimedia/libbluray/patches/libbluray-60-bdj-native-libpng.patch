@@ -1,0 +1,646 @@
+diff --git a/meson.build b/meson.build
+index 6cea3f7..1047525 100644
+--- a/meson.build
++++ b/meson.build
+@@ -196,6 +196,12 @@ if libxml2_dependency.found()
+     cdata.set('HAVE_LIBXML2', 1)
+ endif
+ 
++libpng_dependency = dependency('libpng', required: false)
++if libpng_dependency.found()
++    cdata.set('HAVE_LIBPNG', 1)
++    extra_dependencies += cc.find_library('m', required: false)
++endif
++
+ # libudfread will be built as a subproject if not found on the system
+ libudfread_dependency = dependency('libudfread', version: '>= 1.2.0')
+ cdata.set('HAVE_LIBUDFREAD', 1)
+diff --git a/src/libbluray/bdj/java/java/awt/BDImageConsumer.java b/src/libbluray/bdj/java/java/awt/BDImageConsumer.java
+index 3f54a29..49f3abd 100644
+--- a/src/libbluray/bdj/java/java/awt/BDImageConsumer.java
++++ b/src/libbluray/bdj/java/java/awt/BDImageConsumer.java
+@@ -24,6 +24,8 @@ import java.awt.image.ImageProducer;
+ import java.awt.image.ImageObserver;
+ import java.awt.image.ImageConsumer;
+ import java.awt.image.ColorModel;
++import java.awt.image.DirectColorModel;
++import java.awt.image.IndexColorModel;
+ 
+ class BDImageConsumer extends BDImage implements ImageConsumer {
+     private Hashtable properties;
+@@ -153,22 +155,74 @@ class BDImageConsumer extends BDImage implements ImageConsumer {
+ 
+     }
+ 
++    void setDecodedArgb(int w, int h, int[] pixels) {
++        if ((w >= 0) && (h >= 0) && pixels != null && pixels.length >= w * h) {
++            this.width = w;
++            this.height = h;
++            this.backBuffer = pixels;
++            dirty.add(0, 0, w, h);
++            status |= ImageObserver.WIDTH | ImageObserver.HEIGHT;
++            notifyObservers(this, ImageObserver.WIDTH | ImageObserver.HEIGHT, 0, 0, w, h);
++            status |= ImageObserver.ALLBITS;
++            notifyObservers(this, ImageObserver.ALLBITS, 0, 0, w, h);
++        }
++    }
++
++    private static boolean isStandardArgbModel(ColorModel cm) {
++        if (cm == ColorModel.getRGBdefault())
++            return true;
++        if (cm instanceof DirectColorModel) {
++            DirectColorModel dcm = (DirectColorModel)cm;
++            return !dcm.isAlphaPremultiplied() &&
++                   dcm.getRedMask() == 0x00ff0000 &&
++                   dcm.getGreenMask() == 0x0000ff00 &&
++                   dcm.getBlueMask() == 0x000000ff &&
++                   dcm.getAlphaMask() == 0xff000000;
++        }
++        return false;
++    }
++
+     public void setPixels(int x, int y, int w, int h, ColorModel cm, byte[] pixels, int offset, int scansize) {
+-        int X, Y;
+-        for (Y = y; Y < (y + h); Y++)
+-            for (X = x; X < (x + w); X++)
+-                backBuffer[Y * width + X] = cm.getRGB(pixels[offset + (Y - y) * scansize + (X - x)] & 0xFF);
+-        dirty.add(new Rectangle(x, y, w, h));
++        if (backBuffer == null || w <= 0 || h <= 0)
++            return;
++        if (cm instanceof IndexColorModel) {
++            IndexColorModel icm = (IndexColorModel)cm;
++            int mapSize = icm.getMapSize();
++            int[] lut = new int[256];
++            for (int i = 0; i < mapSize && i < 256; i++)
++                lut[i] = icm.getRGB(i);
++            for (int Y = 0; Y < h; Y++) {
++                int dstOff = (y + Y) * width + x;
++                int srcOff = offset + Y * scansize;
++                for (int X = 0; X < w; X++)
++                    backBuffer[dstOff + X] = lut[pixels[srcOff + X] & 0xFF];
++            }
++        } else {
++            int X, Y;
++            for (Y = y; Y < (y + h); Y++)
++                for (X = x; X < (x + w); X++)
++                    backBuffer[Y * width + X] = cm.getRGB(pixels[offset + (Y - y) * scansize + (X - x)] & 0xFF);
++        }
++        dirty.add(x, y, w, h);
+         status |= ImageObserver.SOMEBITS;
+         notifyObservers(this, ImageObserver.SOMEBITS, x, y, w, h);
+     }
+ 
+     public void setPixels(int x, int y, int w, int h, ColorModel cm, int[] pixels, int offset, int scansize) {
+-        int X, Y;
+-        for (Y = y; Y < (y + h); Y++)
+-            for (X = x; X < (x + w); X++)
+-                backBuffer[Y * width + X] = cm.getRGB(pixels[offset + (Y - y) * scansize + (X - x)]);
+-        dirty.add(new Rectangle(x, y, w, h));
++        if (backBuffer == null || w <= 0 || h <= 0)
++            return;
++        if (isStandardArgbModel(cm)) {
++            for (int Y = 0; Y < h; Y++) {
++                System.arraycopy(pixels, offset + Y * scansize,
++                                 backBuffer, (y + Y) * width + x, w);
++            }
++        } else {
++            int X, Y;
++            for (Y = y; Y < (y + h); Y++)
++                for (X = x; X < (x + w); X++)
++                    backBuffer[Y * width + X] = cm.getRGB(pixels[offset + (Y - y) * scansize + (X - x)]);
++        }
++        dirty.add(x, y, w, h);
+         status |= ImageObserver.SOMEBITS;
+         notifyObservers(this, ImageObserver.SOMEBITS, x, y, w, h);
+     }
+diff --git a/src/libbluray/bdj/java/java/awt/BDToolkitBase.java b/src/libbluray/bdj/java/java/awt/BDToolkitBase.java
+index 18f4014..33cd7e9 100644
+--- a/src/libbluray/bdj/java/java/awt/BDToolkitBase.java
++++ b/src/libbluray/bdj/java/java/awt/BDToolkitBase.java
+@@ -21,9 +21,14 @@
+ package java.awt;
+ 
+ import java.awt.image.ColorModel;
++import java.awt.image.ImageConsumer;
+ import java.awt.image.ImageObserver;
+ import java.awt.image.ImageProducer;
++import java.io.ByteArrayOutputStream;
+ import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
+ import java.net.URL;
+ import java.util.Collections;
+ import java.util.Hashtable;
+@@ -149,6 +154,203 @@ abstract class BDToolkitBase extends Toolkit {
+         return newImage;
+     }
+ 
++    static native int[] decodePngN(byte[] data, int off, int len, int[] dims);
++
++    private static boolean hasPngSignature(byte[] b, int off, int len) {
++        return b != null && off >= 0 && len >= 8 && off + 8 <= b.length &&
++               b[off + 0] == (byte)0x89 && b[off + 1] == (byte)0x50 &&
++               b[off + 2] == (byte)0x4E && b[off + 3] == (byte)0x47 &&
++               b[off + 4] == (byte)0x0D && b[off + 5] == (byte)0x0A &&
++               b[off + 6] == (byte)0x1A && b[off + 7] == (byte)0x0A;
++    }
++
++    private static byte[] readPngStream(InputStream is, int expectedSize) {
++        if (is == null)
++            return null;
++        try {
++            byte[] header = new byte[8];
++            int got = 0;
++            while (got < 8) {
++                int r = is.read(header, got, 8 - got);
++                if (r < 0)
++                    return null;
++                got += r;
++            }
++            if (!hasPngSignature(header, 0, 8))
++                return null;
++
++            if (expectedSize >= 8 && expectedSize <= 32 * 1024 * 1024) {
++                byte[] buf = new byte[expectedSize];
++                System.arraycopy(header, 0, buf, 0, 8);
++                int pos = 8;
++                while (pos < expectedSize) {
++                    int r = is.read(buf, pos, expectedSize - pos);
++                    if (r < 0)
++                        break;
++                    pos += r;
++                }
++                int extra = is.read();
++                if (extra < 0) {
++                    if (pos == expectedSize)
++                        return buf;
++                    byte[] trimmed = new byte[pos];
++                    System.arraycopy(buf, 0, trimmed, 0, pos);
++                    return trimmed;
++                }
++                ByteArrayOutputStream baos = new ByteArrayOutputStream(pos + 65536);
++                baos.write(buf, 0, pos);
++                baos.write(extra);
++                byte[] chunk = new byte[65536];
++                int r;
++                while ((r = is.read(chunk)) >= 0) {
++                    if (r > 0)
++                        baos.write(chunk, 0, r);
++                }
++                return baos.toByteArray();
++            }
++
++            ByteArrayOutputStream baos = new ByteArrayOutputStream(65536);
++            baos.write(header, 0, 8);
++            byte[] chunk = new byte[65536];
++            int r;
++            while ((r = is.read(chunk)) >= 0) {
++                if (r > 0)
++                    baos.write(chunk, 0, r);
++            }
++            return baos.toByteArray();
++        } catch (Throwable t) {
++            return null;
++        } finally {
++            try {
++                is.close();
++            } catch (IOException ignored) {
++            }
++        }
++    }
++
++    private static class BDPngImageProducer implements ImageProducer {
++        private final String filename;
++        private final URL url;
++        private final byte[] rawBytes;
++        private final int rawOffset;
++        private final int rawLength;
++        private final ImageProducer fallback;
++        private ImageConsumer currentConsumer;
++
++        BDPngImageProducer(String filename, ImageProducer fallback) {
++            this.filename = filename;
++            this.url = null;
++            this.rawBytes = null;
++            this.rawOffset = 0;
++            this.rawLength = 0;
++            this.fallback = fallback;
++        }
++
++        BDPngImageProducer(URL url, ImageProducer fallback) {
++            this.filename = null;
++            this.url = url;
++            this.rawBytes = null;
++            this.rawOffset = 0;
++            this.rawLength = 0;
++            this.fallback = fallback;
++        }
++
++        BDPngImageProducer(byte[] data, int off, int len, ImageProducer fallback) {
++            this.filename = null;
++            this.url = null;
++            this.rawBytes = data;
++            this.rawOffset = off;
++            this.rawLength = len;
++            this.fallback = fallback;
++        }
++
++        private boolean tryDecodeAndDeliver(ImageConsumer ic) {
++            if (ic == null)
++                return false;
++            byte[] data = rawBytes;
++            int off = rawOffset;
++            int len = rawLength;
++
++            if (data == null) {
++                if (filename != null) {
++                    try {
++                        File f = new File(filename);
++                        long fLen = f.length();
++                        int expected = (fLen >= 8 && fLen <= 32 * 1024 * 1024) ? (int)fLen : -1;
++                        data = readPngStream(new FileInputStream(f), expected);
++                    } catch (Throwable t) {
++                        data = null;
++                    }
++                } else if (url != null) {
++                    try {
++                        data = readPngStream(url.openStream(), -1);
++                    } catch (Throwable t) {
++                        data = null;
++                    }
++                }
++                if (data == null)
++                    return false;
++                off = 0;
++                len = data.length;
++            }
++
++            if (!hasPngSignature(data, off, len))
++                return false;
++
++            int[] dims = new int[2];
++            int[] pixels;
++            try {
++                pixels = decodePngN(data, off, len, dims);
++            } catch (Throwable t) {
++                pixels = null;
++            }
++            if (pixels == null || dims[0] <= 0 || dims[1] <= 0)
++                return false;
++
++            int w = dims[0];
++            int h = dims[1];
++            if (ic instanceof BDImageConsumer) {
++                ((BDImageConsumer)ic).setDecodedArgb(w, h, pixels);
++            } else {
++                ColorModel cm = ColorModel.getRGBdefault();
++                ic.setDimensions(w, h);
++                ic.setColorModel(cm);
++                ic.setHints(ImageConsumer.TOPDOWNLEFTRIGHT | ImageConsumer.COMPLETESCANLINES |
++                            ImageConsumer.SINGLEPASS | ImageConsumer.SINGLEFRAME);
++                ic.setPixels(0, 0, w, h, cm, pixels, 0, w);
++                ic.imageComplete(ImageConsumer.STATICIMAGEDONE);
++            }
++            return true;
++        }
++
++        public void addConsumer(ImageConsumer ic) {
++            currentConsumer = ic;
++        }
++
++        public boolean isConsumer(ImageConsumer ic) {
++            return (ic != null && ic == currentConsumer) || fallback.isConsumer(ic);
++        }
++
++        public void removeConsumer(ImageConsumer ic) {
++            if (currentConsumer == ic) {
++                currentConsumer = null;
++            }
++            fallback.removeConsumer(ic);
++        }
++
++        public void startProduction(ImageConsumer ic) {
++            currentConsumer = ic;
++            if (!tryDecodeAndDeliver(ic)) {
++                currentConsumer = null;
++                fallback.startProduction(ic);
++            }
++        }
++
++        public void requestTopDownLeftRightResend(ImageConsumer ic) {
++            fallback.requestTopDownLeftRightResend(ic);
++        }
++    }
++
+     public Image createImage(String filename) {
+         if (BDJXletContext.getCurrentContext() == null) {
+             logger.error("createImage(): no context " + Logger.dumpStack());
+@@ -167,7 +369,8 @@ abstract class BDToolkitBase extends Toolkit {
+             }
+         }
+ 
+-        ImageProducer ip = new FileImageSource(filename);
++        ImageProducer fallback = new FileImageSource(filename);
++        ImageProducer ip = new BDPngImageProducer(filename, fallback);
+         Image newImage = createImage(ip);
+         return newImage;
+     }
+@@ -176,7 +379,14 @@ abstract class BDToolkitBase extends Toolkit {
+         if (BDJXletContext.getCurrentContext() == null) {
+             logger.error("createImage(): no context " + Logger.dumpStack());
+         }
+-        ImageProducer ip = new URLImageSource(url);
++        ImageProducer fallback = new URLImageSource(url);
++        ImageProducer ip = fallback;
++        if (url != null) {
++            String proto = url.getProtocol();
++            if ("file".equalsIgnoreCase(proto) || "jar".equalsIgnoreCase(proto)) {
++                ip = new BDPngImageProducer(url, fallback);
++            }
++        }
+         Image newImage = createImage(ip);
+         return newImage;
+     }
+@@ -189,7 +399,10 @@ abstract class BDToolkitBase extends Toolkit {
+             logger.error("createImage(): no context " + Logger.dumpStack());
+         }
+ 
+-        ImageProducer ip = new ByteArrayImageSource(imagedata, imageoffset, imagelength);
++        ImageProducer fallback = new ByteArrayImageSource(imagedata, imageoffset, imagelength);
++        ImageProducer ip = hasPngSignature(imagedata, imageoffset, imagelength)
++            ? (ImageProducer)new BDPngImageProducer(imagedata, imageoffset, imagelength, fallback)
++            : fallback;
+         Image newImage = createImage(ip);
+         return newImage;
+     }
+diff --git a/src/libbluray/bdj/native/java_awt_BDGraphics.c b/src/libbluray/bdj/native/java_awt_BDGraphics.c
+index b6daa97..8051a1f 100644
+--- a/src/libbluray/bdj/native/java_awt_BDGraphics.c
++++ b/src/libbluray/bdj/native/java_awt_BDGraphics.c
+@@ -40,6 +40,11 @@
+ #include FT_FREETYPE_H
+ #endif
+ 
++#ifdef HAVE_LIBPNG
++#include <png.h>
++#include <setjmp.h>
++#endif
++
+ #include "java_awt_BDGraphics.h"
+ 
+ /* Disable some warnings */
+@@ -737,3 +742,193 @@ Java_java_awt_BDGraphics_methods[] =
+ BD_PRIVATE CPP_EXTERN const int
+ Java_java_awt_BDGraphics_methods_count =
+      sizeof(Java_java_awt_BDGraphics_methods)/sizeof(Java_java_awt_BDGraphics_methods[0]);
++
++#ifdef HAVE_LIBPNG
++typedef struct {
++    const uint8_t *data;
++    size_t len;
++    size_t pos;
++} bdg_png_reader_t;
++
++static void bdg_png_read_cb(png_structp png_ptr, png_bytep out, png_size_t count)
++{
++    bdg_png_reader_t *reader = (bdg_png_reader_t *)png_get_io_ptr(png_ptr);
++    if (!reader || count > reader->len - reader->pos) {
++        png_error(png_ptr, "unexpected EOF");
++        return;
++    }
++    memcpy(out, reader->data + reader->pos, count);
++    reader->pos += count;
++}
++
++static void bdg_png_warn_cb(png_structp png_ptr, png_const_charp msg)
++{
++    (void)png_ptr;
++    (void)msg;
++}
++#endif
++
++JNIEXPORT jintArray JNICALL
++Java_java_awt_BDToolkitBase_decodePngN(JNIEnv *env, jclass cls,
++                                       jbyteArray jdata, jint off, jint len, jintArray jdims)
++{
++#ifdef HAVE_LIBPNG
++    if (!jdata || !jdims || off < 0 || len < 8)
++        return NULL;
++
++    jsize dataArrLen = (*env)->GetArrayLength(env, jdata);
++    jsize dimsArrLen = (*env)->GetArrayLength(env, jdims);
++    if (dimsArrLen < 2 || (int64_t)off + (int64_t)len > (int64_t)dataArrLen)
++        return NULL;
++
++    uint8_t sig[8];
++    (*env)->GetByteArrayRegion(env, jdata, off, 8, (jbyte *)sig);
++    if ((*env)->ExceptionCheck(env) || png_sig_cmp(sig, 0, 8) != 0) {
++        (*env)->ExceptionClear(env);
++        return NULL;
++    }
++
++    uint8_t *inBuf = (uint8_t *)malloc((size_t)len);
++    if (!inBuf)
++        return NULL;
++
++    (*env)->GetByteArrayRegion(env, jdata, off, len, (jbyte *)inBuf);
++    if ((*env)->ExceptionCheck(env)) {
++        (*env)->ExceptionClear(env);
++        free(inBuf);
++        return NULL;
++    }
++
++    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, bdg_png_warn_cb);
++    if (!png_ptr) {
++        free(inBuf);
++        return NULL;
++    }
++
++    png_infop info_ptr = png_create_info_struct(png_ptr);
++    if (!info_ptr) {
++        png_destroy_read_struct(&png_ptr, NULL, NULL);
++        free(inBuf);
++        return NULL;
++    }
++
++    uint32_t * volatile outBuf = NULL;
++    png_bytep * volatile rows = NULL;
++    png_uint_32 w = 0u;
++    png_uint_32 h = 0u;
++
++    if (setjmp(png_jmpbuf(png_ptr))) {
++        free(rows);
++        free(outBuf);
++        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
++        free(inBuf);
++        return NULL;
++    }
++
++    bdg_png_reader_t reader;
++    reader.data = inBuf;
++    reader.len = (size_t)len;
++    reader.pos = 0u;
++    png_set_read_fn(png_ptr, &reader, bdg_png_read_cb);
++
++    png_read_info(png_ptr, info_ptr);
++    w = png_get_image_width(png_ptr, info_ptr);
++    h = png_get_image_height(png_ptr, info_ptr);
++    if (w == 0u || h == 0u || w > 8192u || h > 8192u || (uint64_t)w * (uint64_t)h > 33554432ULL) {
++        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
++        free(inBuf);
++        return NULL;
++    }
++
++    int color_type = png_get_color_type(png_ptr, info_ptr);
++    int bit_depth = png_get_bit_depth(png_ptr, info_ptr);
++
++    if (bit_depth == 16)
++        png_set_strip_16(png_ptr);
++    if (color_type == PNG_COLOR_TYPE_PALETTE)
++        png_set_palette_to_rgb(png_ptr);
++    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
++        png_set_expand_gray_1_2_4_to_8(png_ptr);
++    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS))
++        png_set_tRNS_to_alpha(png_ptr);
++    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
++        png_set_gray_to_rgb(png_ptr);
++    if (color_type == PNG_COLOR_TYPE_RGB || color_type == PNG_COLOR_TYPE_GRAY ||
++        color_type == PNG_COLOR_TYPE_PALETTE)
++        png_set_filler(png_ptr, 0xFF, PNG_FILLER_AFTER);
++
++    /* Java int ARGB (0xAARRGGBB) in memory: [B, G, R, A] on little-endian, [A, R, G, B] on big-endian. */
++#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
++    png_set_swap_alpha(png_ptr);
++#else
++    png_set_bgr(png_ptr);
++#endif
++    png_set_interlace_handling(png_ptr);
++    png_read_update_info(png_ptr, info_ptr);
++
++    size_t pixelCount = (size_t)w * (size_t)h;
++    outBuf = (uint32_t *)malloc(pixelCount * sizeof(uint32_t));
++    rows = (png_bytep *)malloc((size_t)h * sizeof(png_bytep));
++    if (!outBuf || !rows) {
++        free(rows);
++        free(outBuf);
++        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
++        free(inBuf);
++        return NULL;
++    }
++
++    for (png_uint_32 ry = 0u; ry < h; ry++) {
++        rows[ry] = (png_bytep)(outBuf + (size_t)ry * (size_t)w);
++    }
++
++    png_read_image(png_ptr, rows);
++    png_read_end(png_ptr, NULL);
++
++    free(rows);
++    rows = NULL;
++    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
++    free(inBuf);
++    inBuf = NULL;
++
++    jintArray result = (*env)->NewIntArray(env, (jsize)pixelCount);
++    if (!result) {
++        free(outBuf);
++        return NULL;
++    }
++
++    (*env)->SetIntArrayRegion(env, result, 0, (jsize)pixelCount, (const jint *)outBuf);
++    free(outBuf);
++
++    if ((*env)->ExceptionCheck(env)) {
++        (*env)->ExceptionClear(env);
++        return NULL;
++    }
++
++    jint dims[2];
++    dims[0] = (jint)w;
++    dims[1] = (jint)h;
++    (*env)->SetIntArrayRegion(env, jdims, 0, 2, dims);
++    if ((*env)->ExceptionCheck(env)) {
++        (*env)->ExceptionClear(env);
++        return NULL;
++    }
++
++    return result;
++#else
++    return NULL;
++#endif
++}
++
++BD_PRIVATE CPP_EXTERN const JNINativeMethod
++Java_java_awt_BDToolkitBase_methods[] =
++{
++    {
++        CC("decodePngN"),
++        CC("([BII[I)[I"),
++        VC(Java_java_awt_BDToolkitBase_decodePngN),
++    },
++};
++
++BD_PRIVATE CPP_EXTERN const int
++Java_java_awt_BDToolkitBase_methods_count =
++     sizeof(Java_java_awt_BDToolkitBase_methods)/sizeof(Java_java_awt_BDToolkitBase_methods[0]);
+diff --git a/src/libbluray/bdj/native/java_awt_BDGraphics.h b/src/libbluray/bdj/native/java_awt_BDGraphics.h
+index 40d8d69..de163c1 100644
+--- a/src/libbluray/bdj/native/java_awt_BDGraphics.h
++++ b/src/libbluray/bdj/native/java_awt_BDGraphics.h
+@@ -33,6 +33,9 @@ JNIEXPORT void JNICALL Java_java_awt_BDGraphics_blitScaledN
+    jint, jint, jint, jint, jintArray, jint, jint, jint, jint, jint, jint,
+    jboolean, jboolean, jint, jfloat);
+ 
++JNIEXPORT jintArray JNICALL Java_java_awt_BDToolkitBase_decodePngN
++  (JNIEnv *, jclass, jbyteArray, jint, jint, jintArray);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/libbluray/bdj/native/register_native.c b/src/libbluray/bdj/native/register_native.c
+index dc6ebb1..e7db675 100644
+--- a/src/libbluray/bdj/native/register_native.c
++++ b/src/libbluray/bdj/native/register_native.c
+@@ -97,10 +97,12 @@ int bdj_register_native_methods(JNIEnv *env)
+     extern const JNINativeMethod Java_org_videolan_Logger_methods[];
+     extern const JNINativeMethod Java_org_videolan_Libbluray_methods[];
+     extern const JNINativeMethod Java_java_awt_BDGraphics_methods[];
++    extern const JNINativeMethod Java_java_awt_BDToolkitBase_methods[];
+     extern const JNINativeMethod Java_java_awt_BDFontMetrics_methods[];
+     extern const int Java_org_videolan_Logger_methods_count;
+     extern const int Java_org_videolan_Libbluray_methods_count;
+     extern const int Java_java_awt_BDGraphics_methods_count;
++    extern const int Java_java_awt_BDToolkitBase_methods_count;
+     extern const int Java_java_awt_BDFontMetrics_methods_count;
+ 
+     int result = _register_methods(env, "org/videolan/Logger",
+@@ -120,11 +122,16 @@ int bdj_register_native_methods(JNIEnv *env)
+         Java_java_awt_BDGraphics_methods,
+         Java_java_awt_BDGraphics_methods_count);
+ 
++    result *= _register_methods(env, "java/awt/BDToolkitBase",
++        Java_java_awt_BDToolkitBase_methods,
++        Java_java_awt_BDToolkitBase_methods_count);
++
+     return result;
+ }
+ 
+ void bdj_unregister_native_methods(JNIEnv *env)
+ {
++    _unregister_methods(env, "java/awt/BDToolkitBase");
+     _unregister_methods(env, "java/awt/BDGraphicsBase");
+     _unregister_methods(env, "java/awt/BDFontMetrics");
+     _unregister_methods(env, "org/videolan/Libbluray");
+diff --git a/src/meson.build b/src/meson.build
+index 255fbc4..3827744 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -110,6 +110,7 @@ libbluray = library('bluray', libbluray_src,
+         fontconfig_dependency,
+         freetype_dependency,
+         libdl_dependency,
++        libpng_dependency,
+         libudfread_dependency,
+         libxml2_dependency,
+         thread_dependency,

@@ -1,0 +1,879 @@
+diff --git a/src/libbluray/bdj/java/java/awt/Area.java b/src/libbluray/bdj/java/java/awt/Area.java
+index 9ae3662..ee21a95 100644
+--- a/src/libbluray/bdj/java/java/awt/Area.java
++++ b/src/libbluray/bdj/java/java/awt/Area.java
+@@ -79,6 +79,15 @@ class Area {
+         }
+     }
+ 
++    public synchronized void add(int rx, int ry, int rw, int rh) {
++        if (rx >= 0 && ry >= 0 && rw > 0 && rh > 0) {
++            x0 = Math.min(x0, rx);
++            x1 = Math.max(x1, rx + rw - 1);
++            y0 = Math.min(y0, ry);
++            y1 = Math.max(y1, ry + rh - 1);
++        }
++    }
++
+     public synchronized boolean isEmpty() {
+         return (x1 < x0) || (y1 < y0);
+     }
+diff --git a/src/libbluray/bdj/java/java/awt/BDGraphicsBase.java b/src/libbluray/bdj/java/java/awt/BDGraphicsBase.java
+index 8b5532c..4983125 100644
+--- a/src/libbluray/bdj/java/java/awt/BDGraphicsBase.java
++++ b/src/libbluray/bdj/java/java/awt/BDGraphicsBase.java
+@@ -521,36 +521,61 @@ abstract class BDGraphicsBase extends DVBGraphics implements ConstrainableGraphi
+     }
+ 
+     public void clearRect(int x, int y, int w, int h) {
++        if (backBuffer == null || w <= 0 || h <= 0) {
++            return;
++        }
+         x += originX;
+         y += originY;
+-        Rectangle rect = new Rectangle(x, y, w, h);
+-        rect = actualClip.intersection(rect);
+-        if (rect.isEmpty() || backBuffer == null) {
++        int x0 = Math.max(x, actualClip.x);
++        int y0 = Math.max(y, actualClip.y);
++        int x1 = Math.min(x + w, actualClip.x + actualClip.width);
++        int y1 = Math.min(y + h, actualClip.y + actualClip.height);
++        if (x0 < 0) x0 = 0;
++        if (y0 < 0) y0 = 0;
++        if (x1 > width) x1 = width;
++        if (y1 > height) y1 = height;
++        int rw = x1 - x0;
++        int rh = y1 - y0;
++        if (rw <= 0 || rh <= 0) {
+             return;
+         }
+-        x = rect.x;
+-        y = rect.y;
+-        w = rect.width;
+-        h = rect.height;
+         int rgb = background.getRGB();
+-        for (int i = 0; i < h; i++)
+-            Arrays.fill(backBuffer, (y + i) * width + x, (y + i) * width + x + w, rgb);
++        for (int i = 0; i < rh; i++)
++            Arrays.fill(backBuffer, (y0 + i) * width + x0, (y0 + i) * width + x0 + rw, rgb);
+ 
+-        dirty.add(rect);
++        dirty.add(x0, y0, rw, rh);
+     }
+ 
+     public void fillRect(int x, int y, int w, int h) {
++        if (backBuffer == null || w <= 0 || h <= 0) {
++            return;
++        }
+         x += originX;
+         y += originY;
+-        Rectangle rect = new Rectangle(x, y, w, h);
+-        rect = actualClip.intersection(rect);
+-        x = rect.x;
+-        y = rect.y;
+-        w = rect.width;
+-        h = rect.height;
++        int x0 = Math.max(x, actualClip.x);
++        int y0 = Math.max(y, actualClip.y);
++        int x1 = Math.min(x + w, actualClip.x + actualClip.width);
++        int y1 = Math.min(y + h, actualClip.y + actualClip.height);
++        if (x0 < 0) x0 = 0;
++        if (y0 < 0) y0 = 0;
++        if (x1 > width) x1 = width;
++        if (y1 > height) y1 = height;
++        int rw = x1 - x0;
++        int rh = y1 - y0;
++        if (rw <= 0 || rh <= 0) {
++            return;
++        }
+         int rgb = foreground.getRGB();
+-        for (int Y = y; Y < (y + h); Y++)
+-            drawSpanN(x, Y, w, rgb);
++        if (xorColor == null) {
++            int ruleCode = compositeRuleCode();
++            if (ruleCode >= 0) {
++                fillRectN(backBuffer, width, height, x0, y0, rw, rh, rgb, ruleCode, composite.getAlpha());
++                dirty.add(x0, y0, rw, rh);
++            }
++            return;
++        }
++        for (int Y = y0; Y < y1; Y++)
++            drawSpanN(x0, Y, rw, rgb);
+     }
+ 
+     public void drawRect(int x, int y, int w, int h) {
+@@ -1178,6 +1203,42 @@ abstract class BDGraphicsBase extends DVBGraphics implements ConstrainableGraphi
+ 
+     protected native void drawStringN(long ftFace, String string, int x, int y, int rgb);
+ 
++    private static native void fillRectN(
++        int[] dst, int dstStride, int dstH,
++        int x, int y, int w, int h,
++        int argb, int rule, float extraAlpha);
++
++    private static native void blitN(
++        int[] dst, int dstStride, int dstH,
++        int dx, int dy, int w, int h,
++        int clipX0, int clipY0, int clipX1, int clipY1,
++        int[] src, int srcStride, int srcH,
++        int sx, int sy,
++        boolean flipX, boolean flipY,
++        int rule, float extraAlpha);
++
++    private static native void blitScaledN(
++        int[] dst, int dstStride, int dstH,
++        int dx, int dy, int dw, int dh,
++        int clipX0, int clipY0, int clipX1, int clipY1,
++        int[] src, int srcStride, int srcH,
++        int sx, int sy, int sw, int sh,
++        boolean flipX, boolean flipY,
++        int rule, float extraAlpha);
++
++    private int compositeRuleCode() {
++        switch (composite.getRule()) {
++            case AlphaComposite.CLEAR:
++                return 0;
++            case AlphaComposite.SRC:
++                return 1;
++            case AlphaComposite.SRC_OVER:
++                return 2;
++            default:
++                return -1;
++        }
++    }
++
+     /** Draws the given string. */
+     public void drawString(String string, int x, int y) {
+         getFontMetrics();
+@@ -1326,6 +1387,7 @@ abstract class BDGraphicsBase extends DVBGraphics implements ConstrainableGraphi
+         if (dh < 0) dh = bdImage.height;
+ 
+         int   stride   = bdImage.width;
++        int   srcH     = bdImage.height;
+         int[] rgbArray = bdImage.getBdBackBuffer();
+         int   bgColor  = 0;
+ 
+@@ -1333,6 +1395,52 @@ abstract class BDGraphicsBase extends DVBGraphics implements ConstrainableGraphi
+             bgColor = bg.getRGB();
+         }
+ 
++        if (xorColor == null && backBuffer != null && rgbArray != null) {
++            int ruleCode = compositeRuleCode();
++            if (ruleCode < 0) {
++                return true;
++            }
++            int destX = dx + originX;
++            int destY = dy + originY;
++            int clipX0 = actualClip.x;
++            int clipY0 = actualClip.y;
++            int clipX1 = clipX0 + actualClip.width;
++            int clipY1 = clipY0 + actualClip.height;
++            if (clipX0 < 0) clipX0 = 0;
++            if (clipY0 < 0) clipY0 = 0;
++            if (clipX1 > width) clipX1 = width;
++            if (clipY1 > height) clipY1 = height;
++
++            int visX0 = Math.max(destX, clipX0);
++            int visY0 = Math.max(destY, clipY0);
++            int visX1 = Math.min(destX + dw, clipX1);
++            int visY1 = Math.min(destY + dh, clipY1);
++            if (visX0 >= visX1 || visY0 >= visY1) {
++                return true;
++            }
++
++            float extraAlpha = composite.getAlpha();
++            if (bg != null) {
++                fillRectN(backBuffer, width, height, visX0, visY0, visX1 - visX0, visY1 - visY0,
++                          bgColor, ruleCode, extraAlpha);
++            }
++
++            if (dw != sw || dh != sh) {
++                blitScaledN(backBuffer, width, height, destX, destY, dw, dh,
++                            clipX0, clipY0, clipX1, clipY1,
++                            rgbArray, stride, srcH, sx, sy, sw, sh,
++                            flipX, flipY, ruleCode, extraAlpha);
++            } else {
++                blitN(backBuffer, width, height, destX, destY, dw, dh,
++                      clipX0, clipY0, clipX1, clipY1,
++                      rgbArray, stride, srcH, sx, sy,
++                      flipX, flipY, ruleCode, extraAlpha);
++            }
++
++            dirty.add(visX0, visY0, visX1 - visX0, visY1 - visY0);
++            return true;
++        }
++
+         // draw background colour
+         for (int i = 0; i < dh && bg != null; i++) {
+             drawSpan(dx, dy + i, dw, bgColor);
+diff --git a/src/libbluray/bdj/native/java_awt_BDGraphics.c b/src/libbluray/bdj/native/java_awt_BDGraphics.c
+index 7fb9e0c..b6daa97 100644
+--- a/src/libbluray/bdj/native/java_awt_BDGraphics.c
++++ b/src/libbluray/bdj/native/java_awt_BDGraphics.c
+@@ -25,6 +25,15 @@
+ 
+ #include <jni.h>
+ #include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#if defined(__ARM_NEON) || defined(__ARM_NEON__)
++#include <arm_neon.h>
++#define BDG_HAS_NEON 1
++#else
++#define BDG_HAS_NEON 0
++#endif
+ 
+ #ifdef HAVE_FT2
+ #include <ft2build.h>
+@@ -44,6 +53,604 @@
+ #define CPP_EXTERN
+ #endif
+ 
++enum {
++    BDG_RULE_CLEAR = 0,
++    BDG_RULE_SRC = 1,
++    BDG_RULE_SRC_OVER = 2
++};
++
++static inline uint32_t bdg_alpha_scale16(jfloat extraAlpha)
++{
++    if (extraAlpha <= 0.0f)
++        return 0u;
++    if (extraAlpha >= 0.9999f)
++        return 65536u;
++    return (uint32_t)(extraAlpha * 65536.0f + 0.5f);
++}
++
++static inline uint32_t bdg_apply_alpha(uint32_t px, uint32_t alphaScale16)
++{
++    if (alphaScale16 >= 65536u)
++        return px;
++    uint32_t a = ((px >> 24) * alphaScale16) >> 16;
++    return (a << 24) | (px & 0x00FFFFFFu);
++}
++
++static inline uint32_t bdg_blend_pixel(uint32_t dest, uint32_t src, uint32_t As)
++{
++    if (As == 0u)
++        return dest;
++    if (As == 255u)
++        return 0xFF000000u | (src & 0x00FFFFFFu);
++    uint32_t Ad = dest >> 24;
++    if (Ad == 0u)
++        return (As << 24) | (src & 0x00FFFFFFu);
++    if (Ad == 255u) {
++        uint32_t inv = 255u - As;
++        uint32_t r = ((src >> 16) & 255u) * As + ((dest >> 16) & 255u) * inv;
++        uint32_t g = ((src >> 8) & 255u) * As + ((dest >> 8) & 255u) * inv;
++        uint32_t b = (src & 255u) * As + (dest & 255u) * inv;
++        r = (r + 1u + (r >> 8)) >> 8;
++        g = (g + 1u + (g >> 8)) >> 8;
++        b = (b + 1u + (b >> 8)) >> 8;
++        return 0xFF000000u | (r << 16) | (g << 8) | b;
++    }
++    uint32_t As255 = As * 255u;
++    uint32_t AdTerm = Ad * (255u - As);
++    uint32_t outA255 = As255 + AdTerm;
++    float invA = 1.0f / (float)outA255;
++    uint32_t r = (uint32_t)(((float)(((src >> 16) & 255u) * As255 + ((dest >> 16) & 255u) * AdTerm)) * invA + 0.5f);
++    uint32_t g = (uint32_t)(((float)(((src >> 8) & 255u) * As255 + ((dest >> 8) & 255u) * AdTerm)) * invA + 0.5f);
++    uint32_t b = (uint32_t)(((float)((src & 255u) * As255 + (dest & 255u) * AdTerm)) * invA + 0.5f);
++    if (r > 255u) r = 255u;
++    if (g > 255u) g = 255u;
++    if (b > 255u) b = 255u;
++    uint32_t outA = (outA255 * 32897u) >> 23;
++    if (outA > 255u) outA = 255u;
++    return (outA << 24) | (r << 16) | (g << 8) | b;
++}
++
++static void bdg_blend_span_src_over(uint32_t *dst, const uint32_t *src,
++                                    int len, uint32_t alphaScale16)
++{
++    if (len <= 0 || alphaScale16 == 0u)
++        return;
++
++    size_t n = (size_t)len;
++    size_t idx = 0u;
++    const int hasScale = (alphaScale16 < 65536u);
++
++#if BDG_HAS_NEON
++    const uint16x8_t vOne16 = vdupq_n_u16(1u);
++    const uint8x8_t vFF = vdup_n_u8(255u);
++    const uint16x4_t vScale16 = vdup_n_u16((uint16_t)alphaScale16);
++
++    for (; idx + 8u <= n; idx += 8u) {
++        uint8x8x4_t sv = vld4_u8((const uint8_t *)(src + idx));
++        uint8x8_t sa = sv.val[3];
++        if (hasScale) {
++            uint16x8_t sa16 = vmovl_u8(sa);
++            uint16x4_t lo16 = vshrn_n_u32(vmull_u16(vget_low_u16(sa16), vScale16), 16);
++            uint16x4_t hi16 = vshrn_n_u32(vmull_u16(vget_high_u16(sa16), vScale16), 16);
++            sa = vmovn_u16(vcombine_u16(lo16, hi16));
++        }
++        uint64_t sa64 = vget_lane_u64(vreinterpret_u64_u8(sa), 0);
++        if (sa64 == 0ULL)
++            continue;
++        if (sa64 == 0xFFFFFFFFFFFFFFFFULL) {
++            memcpy(dst + idx, src + idx, 32u);
++            continue;
++        }
++        uint8x8x4_t dv = vld4_u8((const uint8_t *)(dst + idx));
++        uint64_t da64 = vget_lane_u64(vreinterpret_u64_u8(dv.val[3]), 0);
++        if (da64 == 0xFFFFFFFFFFFFFFFFULL) {
++            uint8x8_t invSa = vsub_u8(vFF, sa);
++            uint16x8_t b16 = vmlal_u8(vmull_u8(sv.val[0], sa), dv.val[0], invSa);
++            uint16x8_t g16 = vmlal_u8(vmull_u8(sv.val[1], sa), dv.val[1], invSa);
++            uint16x8_t r16 = vmlal_u8(vmull_u8(sv.val[2], sa), dv.val[2], invSa);
++            dv.val[0] = vshrn_n_u16(vaddq_u16(vaddq_u16(b16, vOne16), vshrq_n_u16(b16, 8)), 8);
++            dv.val[1] = vshrn_n_u16(vaddq_u16(vaddq_u16(g16, vOne16), vshrq_n_u16(g16, 8)), 8);
++            dv.val[2] = vshrn_n_u16(vaddq_u16(vaddq_u16(r16, vOne16), vshrq_n_u16(r16, 8)), 8);
++            dv.val[3] = vFF;
++            vst4_u8((uint8_t *)(dst + idx), dv);
++            continue;
++        }
++        if (da64 == 0ULL) {
++            uint8x8_t mask = vtst_u8(sa, sa);
++            dv.val[0] = vbsl_u8(mask, sv.val[0], dv.val[0]);
++            dv.val[1] = vbsl_u8(mask, sv.val[1], dv.val[1]);
++            dv.val[2] = vbsl_u8(mask, sv.val[2], dv.val[2]);
++            dv.val[3] = sa;
++            vst4_u8((uint8_t *)(dst + idx), dv);
++            continue;
++        }
++        for (size_t lane = 0u; lane < 8u; lane++) {
++            uint32_t sp = src[idx + lane];
++            uint32_t As = sp >> 24;
++            if (hasScale)
++                As = (As * alphaScale16) >> 16;
++            dst[idx + lane] = bdg_blend_pixel(dst[idx + lane], sp, As);
++        }
++    }
++#endif
++
++    for (size_t rem = n - idx; rem > 0u; rem--, idx++) {
++        uint32_t sp = src[idx];
++        uint32_t As = sp >> 24;
++        if (hasScale)
++            As = (As * alphaScale16) >> 16;
++        dst[idx] = bdg_blend_pixel(dst[idx], sp, As);
++    }
++}
++
++static void bdg_blend_span_src_over_flipx(uint32_t *dst, const uint32_t *src,
++                                          int len, uint32_t alphaScale16)
++{
++    const int hasScale = (alphaScale16 < 65536u);
++    for (int i = 0; i < len; i++) {
++        uint32_t sp = src[len - 1 - i];
++        uint32_t As = sp >> 24;
++        if (hasScale)
++            As = (As * alphaScale16) >> 16;
++        dst[i] = bdg_blend_pixel(dst[i], sp, As);
++    }
++}
++
++static void bdg_copy_span_src(uint32_t *dst, const uint32_t *src,
++                              int len, int flipX, uint32_t alphaScale16)
++{
++    if (len <= 0)
++        return;
++    if (!flipX) {
++        if (alphaScale16 >= 65536u) {
++            memmove(dst, src, (size_t)len * sizeof(uint32_t));
++            return;
++        }
++        for (int i = 0; i < len; i++) {
++            dst[i] = bdg_apply_alpha(src[i], alphaScale16);
++        }
++    } else {
++        for (int i = 0; i < len; i++) {
++            dst[i] = bdg_apply_alpha(src[len - 1 - i], alphaScale16);
++        }
++    }
++}
++
++static void bdg_fill_span(uint32_t *dst, int len, uint32_t argb, int rule, uint32_t alphaScale16)
++{
++    if (len <= 0)
++        return;
++
++    if (rule == BDG_RULE_CLEAR) {
++        memset(dst, 0, (size_t)len * sizeof(uint32_t));
++        return;
++    }
++
++    uint32_t px = bdg_apply_alpha(argb, alphaScale16);
++    if (rule == BDG_RULE_SRC) {
++        for (int i = 0; i < len; i++)
++            dst[i] = px;
++        return;
++    }
++
++    if (rule == BDG_RULE_SRC_OVER) {
++        uint32_t As = px >> 24;
++        if (As == 0u)
++            return;
++        if (As == 255u) {
++            for (int i = 0; i < len; i++)
++                dst[i] = px;
++            return;
++        }
++        size_t n = (size_t)len;
++        size_t idx = 0u;
++#if BDG_HAS_NEON
++        const uint8x8_t vSa = vdup_n_u8((uint8_t)As);
++        const uint8x8_t vInvSa = vdup_n_u8((uint8_t)(255u - As));
++        const uint8x8_t vFF = vdup_n_u8(255u);
++        const uint16x8_t vOne16 = vdupq_n_u16(1u);
++        const uint16x8_t vSr = vmull_u8(vdup_n_u8((uint8_t)((px >> 16) & 255u)), vSa);
++        const uint16x8_t vSg = vmull_u8(vdup_n_u8((uint8_t)((px >> 8) & 255u)), vSa);
++        const uint16x8_t vSb = vmull_u8(vdup_n_u8((uint8_t)(px & 255u)), vSa);
++        for (; idx + 8u <= n; idx += 8u) {
++            uint8x8x4_t dv = vld4_u8((const uint8_t *)(dst + idx));
++            uint64_t da64 = vget_lane_u64(vreinterpret_u64_u8(dv.val[3]), 0);
++            if (da64 == 0xFFFFFFFFFFFFFFFFULL) {
++                uint16x8_t b16 = vmlal_u8(vSb, dv.val[0], vInvSa);
++                uint16x8_t g16 = vmlal_u8(vSg, dv.val[1], vInvSa);
++                uint16x8_t r16 = vmlal_u8(vSr, dv.val[2], vInvSa);
++                dv.val[0] = vshrn_n_u16(vaddq_u16(vaddq_u16(b16, vOne16), vshrq_n_u16(b16, 8)), 8);
++                dv.val[1] = vshrn_n_u16(vaddq_u16(vaddq_u16(g16, vOne16), vshrq_n_u16(g16, 8)), 8);
++                dv.val[2] = vshrn_n_u16(vaddq_u16(vaddq_u16(r16, vOne16), vshrq_n_u16(r16, 8)), 8);
++                dv.val[3] = vFF;
++                vst4_u8((uint8_t *)(dst + idx), dv);
++                continue;
++            }
++            if (da64 == 0ULL) {
++                for (size_t lane = 0u; lane < 8u; lane++)
++                    dst[idx + lane] = px;
++                continue;
++            }
++            for (size_t lane = 0u; lane < 8u; lane++)
++                dst[idx + lane] = bdg_blend_pixel(dst[idx + lane], px, As);
++        }
++#endif
++        for (size_t rem = n - idx; rem > 0u; rem--, idx++) {
++            dst[idx] = bdg_blend_pixel(dst[idx], px, As);
++        }
++    }
++}
++
++JNIEXPORT void JNICALL
++Java_java_awt_BDGraphics_fillRectN(JNIEnv *env, jclass cls,
++                                   jintArray jdst, jint dstStride, jint dstH,
++                                   jint x, jint y, jint w, jint h,
++                                   jint argb, jint rule, jfloat extraAlpha)
++{
++    if (!jdst || dstStride <= 0 || dstH <= 0 || w <= 0 || h <= 0)
++        return;
++
++    int rx0 = x < 0 ? 0 : x;
++    int ry0 = y < 0 ? 0 : y;
++    int rx1 = x + w;
++    int ry1 = y + h;
++    if (rx1 > dstStride) rx1 = dstStride;
++    if (ry1 > dstH) ry1 = dstH;
++    int rw = rx1 - rx0;
++    int rh = ry1 - ry0;
++    if (rw <= 0 || rh <= 0)
++        return;
++
++    jsize dstLen = (*env)->GetArrayLength(env, jdst);
++    if ((int64_t)(ry1 - 1) * (int64_t)dstStride + (int64_t)rx1 > (int64_t)dstLen)
++        return;
++
++    uint32_t alphaScale16 = bdg_alpha_scale16(extraAlpha);
++    uint32_t *dst = (uint32_t *)(*env)->GetPrimitiveArrayCritical(env, jdst, NULL);
++    if (!dst)
++        return;
++
++    for (int row = ry0; row < ry1; row++) {
++        bdg_fill_span(dst + (size_t)row * (size_t)dstStride + (size_t)rx0,
++                      rw, (uint32_t)argb, (int)rule, alphaScale16);
++    }
++
++    (*env)->ReleasePrimitiveArrayCritical(env, jdst, dst, 0);
++}
++
++JNIEXPORT void JNICALL
++Java_java_awt_BDGraphics_blitN(JNIEnv *env, jclass cls,
++                               jintArray jdst, jint dstStride, jint dstH,
++                               jint dx, jint dy, jint w, jint h,
++                               jint clipX0, jint clipY0, jint clipX1, jint clipY1,
++                               jintArray jsrc, jint srcStride, jint srcH,
++                               jint sx, jint sy,
++                               jboolean flipX, jboolean flipY,
++                               jint rule, jfloat extraAlpha)
++{
++    if (!jdst || !jsrc || dstStride <= 0 || dstH <= 0 || srcStride <= 0 || srcH <= 0 || w <= 0 || h <= 0)
++        return;
++
++    if (clipX0 < 0) clipX0 = 0;
++    if (clipY0 < 0) clipY0 = 0;
++    if (clipX1 > dstStride) clipX1 = dstStride;
++    if (clipY1 > dstH) clipY1 = dstH;
++
++    int rx0 = dx > clipX0 ? dx : clipX0;
++    int ry0 = dy > clipY0 ? dy : clipY0;
++    int rx1 = (dx + w) < clipX1 ? (dx + w) : clipX1;
++    int ry1 = (dy + h) < clipY1 ? (dy + h) : clipY1;
++    if (rx0 >= rx1 || ry0 >= ry1)
++        return;
++
++    /* Clamp destination rect so source indices stay strictly inside [0..srcStride) x [0..srcH). */
++    if (!flipX) {
++        if (rx0 < dx - sx) rx0 = dx - sx;
++        if (rx1 > dx + srcStride - sx) rx1 = dx + srcStride - sx;
++    } else {
++        /* srcX = sx + (w - 1) - (dstX - dx), need 0 <= srcX < srcStride */
++        int minDstX = dx + sx + w - srcStride;
++        int maxDstX = dx + sx + w;
++        if (rx0 < minDstX) rx0 = minDstX;
++        if (rx1 > maxDstX) rx1 = maxDstX;
++    }
++    if (!flipY) {
++        if (ry0 < dy - sy) ry0 = dy - sy;
++        if (ry1 > dy + srcH - sy) ry1 = dy + srcH - sy;
++    } else {
++        int minDstY = dy + sy + h - srcH;
++        int maxDstY = dy + sy + h;
++        if (ry0 < minDstY) ry0 = minDstY;
++        if (ry1 > maxDstY) ry1 = maxDstY;
++    }
++
++    int rw = rx1 - rx0;
++    int rh = ry1 - ry0;
++    if (rw <= 0 || rh <= 0)
++        return;
++
++    jsize dstLen = (*env)->GetArrayLength(env, jdst);
++    jsize srcLen = (*env)->GetArrayLength(env, jsrc);
++    if ((int64_t)(ry1 - 1) * (int64_t)dstStride + (int64_t)rx1 > (int64_t)dstLen)
++        return;
++    if ((int64_t)srcH * (int64_t)srcStride > (int64_t)srcLen)
++        return;
++
++    const jboolean sameArr = (*env)->IsSameObject(env, jdst, jsrc);
++    uint32_t *tmpRow = NULL;
++    if (sameArr) {
++        tmpRow = (uint32_t *)malloc((size_t)rw * sizeof(uint32_t));
++        if (!tmpRow)
++            return;
++    }
++
++    uint32_t alphaScale16 = bdg_alpha_scale16(extraAlpha);
++    uint32_t *dst = (uint32_t *)(*env)->GetPrimitiveArrayCritical(env, jdst, NULL);
++    if (!dst) {
++        free(tmpRow);
++        return;
++    }
++    const uint32_t *src = sameArr
++        ? (const uint32_t *)dst
++        : (const uint32_t *)(*env)->GetPrimitiveArrayCritical(env, jsrc, NULL);
++    if (!src) {
++        (*env)->ReleasePrimitiveArrayCritical(env, jdst, dst, JNI_ABORT);
++        free(tmpRow);
++        return;
++    }
++
++    const int srcXStart = !flipX ? (sx + (rx0 - dx)) : (sx + (w - 1) - (rx1 - 1 - dx));
++    const int reverseY = (sameArr && !flipY && dy > sy);
++
++    for (int step = 0; step < rh; step++) {
++        int dstY = reverseY ? (ry1 - 1 - step) : (ry0 + step);
++        int srcY = !flipY ? (sy + (dstY - dy)) : (sy + (h - 1) - (dstY - dy));
++        uint32_t *dstRow = dst + (size_t)dstY * (size_t)dstStride + (size_t)rx0;
++        const uint32_t *srcRow = src + (size_t)srcY * (size_t)srcStride + (size_t)srcXStart;
++        if (sameArr) {
++            memcpy(tmpRow, srcRow, (size_t)rw * sizeof(uint32_t));
++            srcRow = tmpRow;
++        }
++
++        if (rule == BDG_RULE_CLEAR) {
++            memset(dstRow, 0, (size_t)rw * sizeof(uint32_t));
++        } else if (rule == BDG_RULE_SRC) {
++            bdg_copy_span_src(dstRow, srcRow, rw, flipX ? 1 : 0, alphaScale16);
++        } else if (rule == BDG_RULE_SRC_OVER) {
++            if (!flipX) {
++                bdg_blend_span_src_over(dstRow, srcRow, rw, alphaScale16);
++            } else {
++                bdg_blend_span_src_over_flipx(dstRow, srcRow, rw, alphaScale16);
++            }
++        }
++    }
++
++    if (!sameArr) {
++        (*env)->ReleasePrimitiveArrayCritical(env, jsrc, (void *)(uintptr_t)src, JNI_ABORT);
++    }
++    (*env)->ReleasePrimitiveArrayCritical(env, jdst, dst, 0);
++    free(tmpRow);
++}
++
++JNIEXPORT void JNICALL
++Java_java_awt_BDGraphics_blitScaledN(JNIEnv *env, jclass cls,
++                                     jintArray jdst, jint dstStride, jint dstH,
++                                     jint dx, jint dy, jint dw, jint dh,
++                                     jint clipX0, jint clipY0, jint clipX1, jint clipY1,
++                                     jintArray jsrc, jint srcStride, jint srcH,
++                                     jint sx, jint sy, jint sw, jint sh,
++                                     jboolean flipX, jboolean flipY,
++                                     jint rule, jfloat extraAlpha)
++{
++    if (!jdst || !jsrc || dstStride <= 0 || dstH <= 0 || srcStride <= 0 || srcH <= 0 ||
++        dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0)
++        return;
++
++    if (clipX0 < 0) clipX0 = 0;
++    if (clipY0 < 0) clipY0 = 0;
++    if (clipX1 > dstStride) clipX1 = dstStride;
++    if (clipY1 > dstH) clipY1 = dstH;
++
++    int rx0 = dx > clipX0 ? dx : clipX0;
++    int ry0 = dy > clipY0 ? dy : clipY0;
++    int rx1 = (dx + dw) < clipX1 ? (dx + dw) : clipX1;
++    int ry1 = (dy + dh) < clipY1 ? (dy + dh) : clipY1;
++    int outW = rx1 - rx0;
++    int outH = ry1 - ry0;
++    if (outW <= 0 || outH <= 0)
++        return;
++
++    if (sx < 0) { sw += sx; sx = 0; }
++    if (sy < 0) { sh += sy; sy = 0; }
++    if (sx + sw > srcStride) sw = srcStride - sx;
++    if (sy + sh > srcH) sh = srcH - sy;
++    if (sw < 1 || sh < 1)
++        return;
++
++    jsize dstLen = (*env)->GetArrayLength(env, jdst);
++    jsize srcLen = (*env)->GetArrayLength(env, jsrc);
++    if ((int64_t)(ry1 - 1) * (int64_t)dstStride + (int64_t)rx1 > (int64_t)dstLen)
++        return;
++    if ((int64_t)(sy + sh - 1) * (int64_t)srcStride + (int64_t)(sx + sw) > (int64_t)srcLen)
++        return;
++
++    const jboolean sameArr = (*env)->IsSameObject(env, jdst, jsrc);
++    uint32_t *xOff = (uint32_t *)malloc((size_t)outW * sizeof(uint32_t));
++    uint16_t *xW = (uint16_t *)malloc((size_t)outW * sizeof(uint16_t));
++    uint32_t *lineBuf = (uint32_t *)malloc((size_t)outW * sizeof(uint32_t));
++    uint32_t *srcCopy = NULL;
++    if (!xOff || !xW || !lineBuf) {
++        free(lineBuf);
++        free(xW);
++        free(xOff);
++        return;
++    }
++    if (sameArr) {
++        srcCopy = (uint32_t *)malloc((size_t)sh * (size_t)sw * sizeof(uint32_t));
++        if (!srcCopy) {
++            free(lineBuf);
++            free(xW);
++            free(xOff);
++            return;
++        }
++    }
++
++    for (int px = 0; px < outW; px++) {
++        int j = !flipX ? ((rx0 + px) - dx) : ((dw - 1) - ((rx0 + px) - dx));
++        uint32_t fx = (sw > 1)
++            ? (uint32_t)(((uint64_t)j * (uint64_t)(sw - 1) * 256u) / (uint64_t)dw)
++            : 0u;
++        uint32_t xi = fx >> 8;
++        if ((int)xi >= sw - 1) {
++            xi = (uint32_t)(sw - 1);
++            xW[px] = 0u;
++        } else {
++            xW[px] = (uint16_t)(fx & 255u);
++        }
++        xOff[px] = xi;
++    }
++
++    uint32_t alphaScale16 = bdg_alpha_scale16(extraAlpha);
++    uint32_t *dst = (uint32_t *)(*env)->GetPrimitiveArrayCritical(env, jdst, NULL);
++    if (!dst) {
++        free(srcCopy);
++        free(lineBuf);
++        free(xW);
++        free(xOff);
++        return;
++    }
++    const uint32_t *src = sameArr
++        ? (const uint32_t *)dst
++        : (const uint32_t *)(*env)->GetPrimitiveArrayCritical(env, jsrc, NULL);
++    if (!src) {
++        (*env)->ReleasePrimitiveArrayCritical(env, jdst, dst, JNI_ABORT);
++        free(srcCopy);
++        free(lineBuf);
++        free(xW);
++        free(xOff);
++        return;
++    }
++
++    int effSrcStride = srcStride;
++    int effSx = sx;
++    int effSy = sy;
++    if (sameArr) {
++        for (int r = 0; r < sh; r++) {
++            memcpy(srcCopy + (size_t)r * (size_t)sw,
++                   src + (size_t)(sy + r) * (size_t)srcStride + (size_t)sx,
++                   (size_t)sw * sizeof(uint32_t));
++        }
++        src = srcCopy;
++        effSrcStride = sw;
++        effSx = 0;
++        effSy = 0;
++    }
++
++    if (sw == 1 && sh == 1) {
++        uint32_t singlePx = src[(size_t)effSy * (size_t)effSrcStride + (size_t)effSx];
++        for (int dstY = ry0; dstY < ry1; dstY++) {
++            bdg_fill_span(dst + (size_t)dstY * (size_t)dstStride + (size_t)rx0,
++                          outW, singlePx, (int)rule, alphaScale16);
++        }
++    } else if (rule == BDG_RULE_CLEAR) {
++        for (int dstY = ry0; dstY < ry1; dstY++) {
++            memset(dst + (size_t)dstY * (size_t)dstStride + (size_t)rx0, 0,
++                   (size_t)outW * sizeof(uint32_t));
++        }
++    } else {
++        for (int dstY = ry0; dstY < ry1; dstY++) {
++            int i = !flipY ? (dstY - dy) : ((dh - 1) - (dstY - dy));
++            uint32_t fy = (sh > 1)
++                ? (uint32_t)(((uint64_t)i * (uint64_t)(sh - 1) * 256u) / (uint64_t)dh)
++                : 0u;
++            int yi = (int)(fy >> 8);
++            uint32_t wy = fy & 255u;
++            int yi1 = yi + 1;
++            if (yi >= sh - 1) {
++                yi = sh - 1;
++                yi1 = sh - 1;
++                wy = 0u;
++            }
++            uint32_t wy1 = 256u - wy;
++
++            const uint32_t *row0 = src + (size_t)(effSy + yi) * (size_t)effSrcStride + (size_t)effSx;
++            const uint32_t *row1 = src + (size_t)(effSy + yi1) * (size_t)effSrcStride + (size_t)effSx;
++
++            for (int px = 0; px < outW; px++) {
++                uint32_t xi = xOff[px];
++                uint32_t xi1 = (xi + 1u < (uint32_t)sw) ? (xi + 1u) : xi;
++                uint32_t wx = xW[px];
++                uint32_t wx1 = 256u - wx;
++
++                uint32_t a = row0[xi];
++                uint32_t b = row0[xi1];
++                uint32_t c = row1[xi];
++                uint32_t d = row1[xi1];
++                uint32_t aA = a >> 24;
++                uint32_t bA = b >> 24;
++                uint32_t cA = c >> 24;
++                uint32_t dA = d >> 24;
++                if ((aA | bA | cA | dA) == 0u) {
++                    lineBuf[px] = 0u;
++                    continue;
++                }
++                uint32_t w00 = (wx1 * wy1) >> 8;
++                uint32_t w10 = (wx * wy1) >> 8;
++                uint32_t w01 = (wx1 * wy) >> 8;
++                uint32_t w11 = 256u - w00 - w10 - w01;
++                if (aA == bA && aA == cA && aA == dA) {
++                    uint32_t r = (((a >> 16) & 255u) * w00 + ((b >> 16) & 255u) * w10 +
++                                  ((c >> 16) & 255u) * w01 + ((d >> 16) & 255u) * w11 + 128u) >> 8;
++                    uint32_t g = (((a >> 8) & 255u) * w00 + ((b >> 8) & 255u) * w10 +
++                                  ((c >> 8) & 255u) * w01 + ((d >> 8) & 255u) * w11 + 128u) >> 8;
++                    uint32_t bl = ((a & 255u) * w00 + (b & 255u) * w10 +
++                                   (c & 255u) * w01 + (d & 255u) * w11 + 128u) >> 8;
++                    lineBuf[px] = (aA << 24) | (r << 16) | (g << 8) | bl;
++                } else {
++                    uint32_t f0 = w00 * aA;
++                    uint32_t f1 = w10 * bA;
++                    uint32_t f2 = w01 * cA;
++                    uint32_t f3 = w11 * dA;
++                    uint32_t sumA = f0 + f1 + f2 + f3;
++                    if (sumA == 0u) {
++                        lineBuf[px] = 0u;
++                        continue;
++                    }
++                    float inv = 1.0f / (float)sumA;
++                    uint32_t r = (uint32_t)(((float)(((a >> 16) & 255u) * f0 + ((b >> 16) & 255u) * f1 +
++                                                     ((c >> 16) & 255u) * f2 + ((d >> 16) & 255u) * f3)) * inv + 0.5f);
++                    uint32_t g = (uint32_t)(((float)(((a >> 8) & 255u) * f0 + ((b >> 8) & 255u) * f1 +
++                                                     ((c >> 8) & 255u) * f2 + ((d >> 8) & 255u) * f3)) * inv + 0.5f);
++                    uint32_t bl = (uint32_t)(((float)((a & 255u) * f0 + (b & 255u) * f1 +
++                                                      (c & 255u) * f2 + (d & 255u) * f3)) * inv + 0.5f);
++                    uint32_t al = (sumA + 128u) >> 8;
++                    if (al > 255u) al = 255u;
++                    if (r > 255u) r = 255u;
++                    if (g > 255u) g = 255u;
++                    if (bl > 255u) bl = 255u;
++                    lineBuf[px] = (al << 24) | (r << 16) | (g << 8) | bl;
++                }
++            }
++
++            uint32_t *dstRow = dst + (size_t)dstY * (size_t)dstStride + (size_t)rx0;
++            if (rule == BDG_RULE_SRC_OVER) {
++                bdg_blend_span_src_over(dstRow, lineBuf, outW, alphaScale16);
++            } else if (rule == BDG_RULE_SRC) {
++                bdg_copy_span_src(dstRow, lineBuf, outW, 0, alphaScale16);
++            }
++        }
++    }
++
++    if (!sameArr) {
++        (*env)->ReleasePrimitiveArrayCritical(env, jsrc, (void *)(uintptr_t)src, JNI_ABORT);
++    }
++    (*env)->ReleasePrimitiveArrayCritical(env, jdst, dst, 0);
++    free(srcCopy);
++    free(lineBuf);
++    free(xW);
++    free(xOff);
++}
++
+ JNIEXPORT void JNICALL
+ Java_java_awt_BDGraphics_drawStringN(JNIEnv * env, jobject obj, jlong ftFace, jstring string, jint x, jint y, jint rgb)
+ {
+@@ -105,6 +712,21 @@ Java_java_awt_BDGraphics_methods[] =
+         CC("(JLjava/lang/String;III)V"),
+         VC(Java_java_awt_BDGraphics_drawStringN),
+     },
++    {
++        CC("fillRectN"),
++        CC("([I" "IIIIIIII" "F)V"),
++        VC(Java_java_awt_BDGraphics_fillRectN),
++    },
++    {
++        CC("blitN"),
++        CC("([I" "IIIIIIIIII" "[I" "IIII" "ZZIF)V"),
++        VC(Java_java_awt_BDGraphics_blitN),
++    },
++    {
++        CC("blitScaledN"),
++        CC("([I" "IIIIIIIIII" "[I" "IIIIII" "ZZIF)V"),
++        VC(Java_java_awt_BDGraphics_blitScaledN),
++    },
+ };
+ 
+ BD_PRIVATE CPP_EXTERN const int
+diff --git a/src/libbluray/bdj/native/java_awt_BDGraphics.h b/src/libbluray/bdj/native/java_awt_BDGraphics.h
+index 704c425..40d8d69 100644
+--- a/src/libbluray/bdj/native/java_awt_BDGraphics.h
++++ b/src/libbluray/bdj/native/java_awt_BDGraphics.h
+@@ -20,6 +20,19 @@ extern "C" {
+ JNIEXPORT void JNICALL Java_java_awt_BDGraphics_drawStringN
+   (JNIEnv *, jobject, jlong, jstring, jint, jint, jint);
+ 
++JNIEXPORT void JNICALL Java_java_awt_BDGraphics_fillRectN
++  (JNIEnv *, jclass, jintArray, jint, jint, jint, jint, jint, jint, jint, jint, jfloat);
++
++JNIEXPORT void JNICALL Java_java_awt_BDGraphics_blitN
++  (JNIEnv *, jclass, jintArray, jint, jint, jint, jint, jint, jint,
++   jint, jint, jint, jint, jintArray, jint, jint, jint, jint,
++   jboolean, jboolean, jint, jfloat);
++
++JNIEXPORT void JNICALL Java_java_awt_BDGraphics_blitScaledN
++  (JNIEnv *, jclass, jintArray, jint, jint, jint, jint, jint, jint,
++   jint, jint, jint, jint, jintArray, jint, jint, jint, jint, jint, jint,
++   jboolean, jboolean, jint, jfloat);
++
+ #ifdef __cplusplus
+ }
+ #endif

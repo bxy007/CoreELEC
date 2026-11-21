@@ -1,0 +1,79 @@
+Subject: [PATCH] Hint on-demand file I/O for paired Blu-ray MVC streams
+
+Hosts can keep both MVC views on their playback thread. This avoids
+independent read-ahead workers seeking the same backing ISO in turn.
+
+diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -714,6 +714,26 @@
+     m2ts_filter_close(&st->m2ts_filter);
+ }
+ 
++/* File-open callbacks are synchronous. Keep the hint on their calling thread
++ * so BD-J resource opens cannot see another thread's playback state. */
++static __thread int file_open_direct_io;
++
++int bd_file_open_use_direct_io(void)
++{
++    return file_open_direct_io;
++}
++
++static int _has_mvc_subpath(const MPLS_PL *pl)
++{
++    for (unsigned i = 0; i < pl->ext_sub_count; i++) {
++        const MPLS_SUB *sub = &pl->ext_sub_path[i];
++        if (sub->type == mpls_sub_path_ss_video && sub->sub_playitem_count == pl->list_count) {
++            return 1;
++        }
++    }
++    return 0;
++}
++
+ static int _open_m2ts(BLURAY *bd, BD_STREAM *st)
+ {
+     _close_m2ts(st);
+@@ -722,7 +742,10 @@
+         return 0;
+     }
+ 
++    const int saved_direct_io = file_open_direct_io;
++    file_open_direct_io = st == &bd->st0 && _has_mvc_subpath(st->clip->title->pl);
+     st->fp = disc_open_stream(bd->disc, st->clip->name);
++    file_open_direct_io = saved_direct_io;
+ 
+     st->clip_size = 0;
+     st->clip_pos = (uint64_t)st->clip->start_pkt * 192;
+@@ -5020,7 +5043,11 @@
+     if (!bd || path == NULL) {
+         return NULL;
+     }
+-    return disc_open_path_dec(bd->disc, path);
++    const int saved_direct_io = file_open_direct_io;
++    file_open_direct_io = 1;
++    BD_FILE_H *fp = disc_open_path_dec(bd->disc, path);
++    file_open_direct_io = saved_direct_io;
++    return fp;
+ }
+ 
+ /*
+diff --git a/src/libbluray/bluray.h b/src/libbluray/bluray.h
+--- a/src/libbluray/bluray.h
++++ b/src/libbluray/bluray.h
+@@ -1387,6 +1387,16 @@
+ BD_PUBLIC struct bd_file_s *bd_open_file_dec(BLURAY *bd, const char *path);
+ 
++#define BD_FILE_OPEN_DIRECT_IO_HINT 1
++
+ /**
++ * Query the I/O hint inside the current bd_open_files file-open callback.
++ *
++ * @return 1 for the primary stream of an MVC playlist or an explicit decrypted
++ *         file open, 0 otherwise
++ */
++BD_PUBLIC int bd_file_open_use_direct_io(void);
++
++/**
+  * Get the MPLS struct of the current title
+  *
+  * @param bd BLURAY object

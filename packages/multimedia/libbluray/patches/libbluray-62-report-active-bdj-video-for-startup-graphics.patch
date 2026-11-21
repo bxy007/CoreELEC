@@ -1,0 +1,77 @@
+Subject: [PATCH] bluray: report started BD-J video to the graphics consumer
+
+Distinguish a running video playlist from one prefetched by the disc
+application or a menu without video. Keep the query lock-free for
+callers inside the ARGB overlay callback.
+
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -176,6 +176,7 @@
+     /* BD-J */
+     BDJAVA         *bdjava;
+     BDJ_CONFIG      bdj_config;
++    unsigned        bdj_video_active; /* accessed atomically from the graphics callback */
+     uint8_t         bdj_wait_start;  /* BD-J has selected playlist (prefetch) but not yet started playback */
+     uint8_t         bdj_started;     /* BD-J has started playback and not stopped it */
+     uint8_t         bdj_psr_write;   /* BD-J is writing PSR 4 (the loader is its only BD-J writer) */
+@@ -1387,12 +1388,18 @@
+     return 0;
+ }
+ 
++int bd_bdj_video_active(BLURAY *bd)
++{
++    return __atomic_load_n(&bd->bdj_video_active, __ATOMIC_RELAXED);
++}
++
+ void bdpriv_select_rate(BLURAY *bd, float rate, int reason)
+ {
+     if (reason == BDJ_PLAYBACK_STOP) {
+         /* playback stop. Might want to wait for buffers empty here. */
+         bd_mutex_lock(&bd->mutex);
+         bd->bdj_started = 0;
++        __atomic_store_n(&bd->bdj_video_active, 0, __ATOMIC_RELAXED);
+         bd_mutex_unlock(&bd->mutex);
+         return;
+     }
+@@ -1402,6 +1409,9 @@
+         /* playback is triggered by bdpriv_select_rate() */
+         bd->bdj_wait_start = 0;
+         bd->bdj_started = 1;
++        const NAV_CLIP *clip = bd->st0.clip;
++        const int has_video = clip && clip->title->pl->play_item[clip->ref].stn.num_video;
++        __atomic_store_n(&bd->bdj_video_active, has_video, __ATOMIC_RELAXED);
+         if (bd->pres_active && bd->title_type == title_bdj) {
+             bd->pres_start = 1;
+             bd->pres_seek = 0;
+@@ -3070,6 +3080,8 @@
+ /* returns 1 if the IG plane is kept on screen */
+ static int _close_playlist(BLURAY *bd, int keep_ig)
+ {
++    __atomic_store_n(&bd->bdj_video_active, 0, __ATOMIC_RELAXED);
++
+     /* the application has not been told of the end yet */
+     int end_held = _pres_end_held(bd);
+     int ig_kept = 0;
+@@ -4247,6 +4259,7 @@
+ {
+     bd->presented_time = -1;
+     bd->bdj_started = 0;
++    __atomic_store_n(&bd->bdj_video_active, 0, __ATOMIC_RELAXED);
+     _pres_flush(bd);
+     _clock_reset(bd, -1);
+ 
+--- a/src/libbluray/bluray.h
++++ b/src/libbluray/bluray.h
+@@ -1029,6 +1029,12 @@
+  */
+ BD_PUBLIC void bd_register_argb_overlay_proc(BLURAY *bd, void *handle, bd_argb_overlay_proc_f func, struct bd_argb_buffer_s *buf);
+ 
++/**
++ * Return whether BD-J has started the current playlist with primary video.
++ * This may be called from the ARGB overlay callback.
++ */
++BD_PUBLIC int bd_bdj_video_active(BLURAY *bd);
++
+ 
+ /*
+  * Playback with on-disc menus
