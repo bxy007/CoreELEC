@@ -1,0 +1,102 @@
+--- a/src/libbluray/bluray.h
++++ b/src/libbluray/bluray.h
+@@ -1361,6 +1361,32 @@
+  */
+ BD_PUBLIC int bd_get_clip_infos(BLURAY *bd, unsigned clip, uint64_t *clip_start_time, uint64_t *stream_start_time, uint64_t *pos, uint64_t *duration);
+ 
++#define BLURAY_HAVE_IN_MUX_PIP 1
++
++/** Placement of synchronous secondary video in the primary video plane. */
++typedef struct bd_pip_placement {
++    uint32_t time;                 /**< Clip presentation timestamp (45 kHz) */
++    uint16_t x, y;
++    uint8_t scale;                 /**< MPLS PiP scale code */
++} BLURAY_PIP_PLACEMENT;
++
++/** Display parameters of an in-mux, synchronous secondary video stream. */
++typedef struct bd_pip_layout {
++    uint32_t in_time, out_time;    /**< PlayItem timestamps (45 kHz) */
++    uint16_t pid;
++    int16_t luma_key;              /**< Maximum transparent Y code, or -1 if disabled */
++    uint8_t trick_play;
++} BLURAY_PIP_LAYOUT;
++
++/**
++ * Copy the PiP layout for a one-based secondary video stream in a PlayItem.
++ * Return the required placement count, or zero if the requested layout is unavailable.
++ * Pass a NULL placements pointer to query the count. Copy only when capacity suffices.
++ */
++BD_PUBLIC unsigned bd_get_in_mux_pip_layout(BLURAY *bd, uint32_t playlist, unsigned playitem,
++                                             unsigned stream, BLURAY_PIP_LAYOUT *layout,
++                                             BLURAY_PIP_PLACEMENT *placements, unsigned capacity);
++
+ /**
+  *
+  *  Open a directory from BluRay Virtual File System.
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -5199,6 +5199,64 @@
+     return 0;
+ }
+ 
++unsigned bd_get_in_mux_pip_layout(BLURAY *bd, uint32_t playlist, unsigned playitem,
++                                  unsigned stream, BLURAY_PIP_LAYOUT *layout,
++                                  BLURAY_PIP_PLACEMENT *placements, unsigned capacity)
++{
++    unsigned count = 0;
++    if (!bd || !layout || !stream || playlist > 99999)
++        return 0;
++
++    bd_mutex_lock(&bd->mutex);
++    if (!bd->title || !bd->title->pl)
++        goto out;
++
++    char *end;
++    if (strtoul(bd->title->name, &end, 10) != playlist ||
++        end == bd->title->name || strcmp(end, ".mpls"))
++        goto out;
++
++    const MPLS_PL *pl = bd->title->pl;
++    if (!pl->play_item || playitem >= pl->list_count || !pl->ext_pip_data)
++        goto out;
++
++    const MPLS_PI *item = &pl->play_item[playitem];
++    if (!item->stn.secondary_video || stream > item->stn.num_secondary_video)
++        goto out;
++
++    const MPLS_STREAM *video = &item->stn.secondary_video[stream - 1];
++    if (video->stream_type != 3 || !pl->sub_path || video->subpath_id >= pl->sub_count ||
++        pl->sub_path[video->subpath_id].type != mpls_sub_path_sync_pip)
++        goto out;
++
++    for (unsigned i = 0; i < pl->ext_pip_data_count; i++) {
++        const MPLS_PIP_METADATA *data = &pl->ext_pip_data[i];
++        if (data->clip_ref != playitem || data->secondary_video_ref != stream - 1 ||
++            data->timeline_type != pip_timeline_sync_mainpath || !data->data_count || !data->data)
++            continue;
++
++        count = data->data_count;
++        layout->pid = video->pid;
++        layout->in_time = item->in_time;
++        layout->out_time = item->out_time;
++        layout->luma_key = data->luma_key_flag ? data->upper_limit_luma_key : -1;
++        layout->trick_play = data->trick_play_flag;
++        if (placements && capacity >= count) {
++            for (unsigned n = 0; n < count; n++) {
++                placements[n].time = data->data[n].time;
++                placements[n].x = data->data[n].xpos;
++                placements[n].y = data->data[n].ypos;
++                placements[n].scale = data->data[n].scale_factor;
++            }
++        }
++        break;
++    }
++
++out:
++    bd_mutex_unlock(&bd->mutex);
++    return count;
++}
++
+ struct mpls_pl *bd_get_title_mpls(BLURAY *bd)
+ {
+ 	if (bd && bd->title) {
