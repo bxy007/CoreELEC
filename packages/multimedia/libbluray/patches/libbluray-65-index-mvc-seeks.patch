@@ -1,0 +1,158 @@
+Subject: [PATCH] Match MVC seek points using the dependent view CPI
+
+--- a/src/libbluray/bluray.h
++++ b/src/libbluray/bluray.h
+@@ -1361,6 +1361,17 @@
+  */
+ BD_PUBLIC int bd_get_clip_infos(BLURAY *bd, unsigned clip, uint64_t *clip_start_time, uint64_t *stream_start_time, uint64_t *pos, uint64_t *duration);
+ 
++#define BLURAY_HAVE_MVC_SEEK_OFFSET 1
++
++/**
++ * Find the dependent view's byte offset at the base view's current seek point.
++ * Call after positioning the title and before reading the base view. The file
++ * basename and PID identify the open MVC stream. Returns -1 if the two entry
++ * points cannot be matched.
++ */
++BD_PUBLIC int64_t bd_get_mvc_seek_offset(BLURAY *bd, unsigned subpath,
++                                        const char *file, uint16_t pid);
++
+ #define BLURAY_HAVE_IN_MUX_PIP 1
+ 
+ /** Placement of synchronous secondary video in the primary video plane. */
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -5199,6 +5199,59 @@
+     return 0;
+ }
+ 
++int64_t bd_get_mvc_seek_offset(BLURAY *bd, unsigned subpath, const char *file, uint16_t pid)
++{
++    int64_t offset = -1;
++    if (!bd || !file)
++        return -1;
++
++    bd_mutex_lock(&bd->mutex);
++    const NAV_CLIP *clip = bd->st0.clip;
++    if (!bd->title || !bd->title->pl || !clip || !clip->cl || !bd->st0.seek_flag)
++        goto out;
++
++    const MPLS_PL *pl = bd->title->pl;
++    if (!pl->play_item || clip->ref >= pl->list_count ||
++        !pl->ext_sub_path || subpath >= pl->ext_sub_count)
++        goto out;
++
++    const MPLS_PI *item = &pl->play_item[clip->ref];
++    const MPLS_SUB *sub = &pl->ext_sub_path[subpath];
++    if (sub->type != mpls_sub_path_ss_video || !sub->sub_play_item ||
++        clip->ref >= sub->sub_playitem_count || !item->clip || clip->angle >= item->angle_count ||
++        !item->stn.num_video || !item->stn.video || !clip->cl->cpi.num_stream_pid ||
++        !clip->cl->cpi.entry || clip->cl->cpi.entry[0].pid != item->stn.video[0].pid)
++        goto out;
++
++    const MPLS_SUB_PI *view = &sub->sub_play_item[clip->ref];
++    if (!view->clip || view->clip_count != 1 || view->sync_play_item_id != clip->ref ||
++        view->in_time != view->sync_pts)
++        goto out;
++
++    char filename[11];
++    snprintf(filename, sizeof(filename), "%.5s.m2ts", view->clip->clip_id);
++    if (strcmp(file, filename))
++        goto out;
++
++    const uint64_t base_spn = bd->st0.clip_pos / 192;
++    if (bd->st0.clip_pos % 192 || base_spn < clip->start_pkt || base_spn >= clip->end_pkt)
++        goto out;
++
++    snprintf(filename, sizeof(filename), "%.5s.clpi", view->clip->clip_id);
++    const CLPI_CL *mvc = clpi_get(bd->disc, filename);
++    if (mvc) {
++        uint32_t spn;
++        if (clpi_lookup_mvc_spn(clip->cl, (uint32_t)base_spn, item->clip[clip->angle].stc_id,
++                                mvc, pid, view->clip->stc_id, &spn))
++            offset = (int64_t)spn * 192;
++        clpi_unref(&mvc);
++    }
++
++out:
++    bd_mutex_unlock(&bd->mutex);
++    return offset;
++}
++
+ unsigned bd_get_in_mux_pip_layout(BLURAY *bd, uint32_t playlist, unsigned playitem,
+                                   unsigned stream, BLURAY_PIP_LAYOUT *layout,
+                                   BLURAY_PIP_PLACEMENT *placements, unsigned capacity)
+--- a/src/libbluray/bdnav/clpi_parse.h
++++ b/src/libbluray/bdnav/clpi_parse.h
+@@ -34,6 +34,9 @@
+ BD_PRIVATE uint32_t clpi_lookup_spn(const struct clpi_cl *cl, uint32_t timestamp, int before, uint8_t stc_id);
+ BD_PRIVATE int      clpi_lookup_ep_pair(const struct clpi_cl *cl, uint32_t spn, uint16_t pid, uint16_t pair_pid,
+                                         uint8_t stc_id, uint32_t *pid_spn, uint32_t *pair_spn);
++BD_PRIVATE int      clpi_lookup_mvc_spn(const struct clpi_cl *base, uint32_t base_spn,
++                                        uint8_t base_stc, const struct clpi_cl *mvc,
++                                        uint16_t mvc_pid, uint8_t mvc_stc, uint32_t *mvc_spn);
+ BD_PRIVATE uint32_t clpi_access_point(const struct clpi_cl *cl, uint32_t pkt, int next, int angle_change, uint32_t *time);
+ 
+ /* preserved for old clpi API */
+--- a/src/libbluray/bdnav/clpi_parse.c
++++ b/src/libbluray/bdnav/clpi_parse.c
+@@ -576,6 +576,9 @@
+ {
+     int ii, jj, end;
+ 
++    if (!entry->num_ep_coarse || !entry->num_ep_fine || !entry->coarse || !entry->fine)
++        return 0;
++
+     for (ii = 0; ii < entry->num_ep_coarse; ii++) {
+         if (ii < entry->num_ep_coarse - 1) {
+             end = entry->coarse[ii+1].ref_ep_fine_id;
+@@ -616,6 +619,49 @@
+     return _find_ep(pair, stc_spn, &pts, &pair_pts, pair_spn);
+ }
+ 
++static int _stc_spn_range(const CLPI_CL *cl, uint8_t stc_id, uint32_t *start, uint32_t *end)
++{
++    for (unsigned i = 0; i < cl->sequence.num_atc_seq; i++) {
++        const CLPI_ATC_SEQ *atc = &cl->sequence.atc_seq[i];
++        if (stc_id < atc->offset_stc_id || stc_id >= atc->offset_stc_id + atc->num_stc_seq)
++            continue;
++
++        unsigned index = stc_id - atc->offset_stc_id;
++        *start = atc->stc_seq[index].spn_stc_start;
++        if (index + 1 < atc->num_stc_seq)
++            *end = atc->stc_seq[index + 1].spn_stc_start;
++        else if (i + 1 < cl->sequence.num_atc_seq)
++            *end = cl->sequence.atc_seq[i + 1].spn_atc_start;
++        else
++            *end = cl->clip.num_source_packets;
++        return *start < *end && *end <= cl->clip.num_source_packets;
++    }
++    return 0;
++}
++
++int clpi_lookup_mvc_spn(const CLPI_CL *base, uint32_t base_spn, uint8_t base_stc,
++                       const CLPI_CL *mvc, uint16_t mvc_pid, uint8_t mvc_stc, uint32_t *mvc_spn)
++{
++    uint32_t base_start, base_end, mvc_start, mvc_end;
++    uint32_t pts, spn, mvc_pts, matching_spn;
++
++    if (!base->cpi.num_stream_pid || !base->cpi.entry || !mvc->cpi_ss.entry ||
++        !_stc_spn_range(base, base_stc, &base_start, &base_end) ||
++        !_stc_spn_range(mvc, mvc_stc, &mvc_start, &mvc_end) ||
++        base_spn < base_start || base_spn >= base_end)
++        return 0;
++
++    const CLPI_EP_MAP_ENTRY *view = _find_ep_map(&mvc->cpi_ss, mvc_pid);
++    // A time seek can leave the base view one packet before its CPI entry.
++    if (!view || !_find_ep(&base->cpi.entry[0], base_spn, NULL, &pts, &spn) ||
++        spn >= base_end || spn - base_spn > 1 ||
++        !_find_ep(view, mvc_start, &pts, &mvc_pts, &matching_spn) || matching_spn >= mvc_end)
++        return 0;
++
++    *mvc_spn = matching_spn;
++    return 1;
++}
++
+ // Looks up the start packet number that is closest to the requested packet
+ // Returns the spn for the entry that is closest to but
+ // before the given packet
