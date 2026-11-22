@@ -1,0 +1,80 @@
+Subject: [PATCH] bluray: deliver HDMV clip events before the new clip's data
+
+A natural play-item transition can return its event along with new clip
+bytes. An HDMV player may need to close its current demuxer at that
+event. Bytes already delivered to the old demuxer can include the new
+clip's first access unit.
+
+Stop the HDMV navigation read after opening the next clip and deliver
+the event queue before reading that clip.
+
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -2669,7 +2669,7 @@
+     return bd->s_pos;
+ }
+ 
+-static int _bd_read(BLURAY *bd, unsigned char *buf, int len)
++static int _bd_read(BLURAY *bd, unsigned char *buf, int len, BD_EVENT *clip_event)
+ {
+     BD_STREAM *st = &bd->st0;
+     int out_len = 0;
+@@ -2748,6 +2748,11 @@
+                         _queue_event(bd, BD_EVENT_DISCONTINUITY, st->clip->in_time);
+                     }
+ 
++                    /* A play-item change may require the caller to reopen its demuxer.
++                     * Deliver the queued events before consuming the new clip's data. */
++                    if (clip_event && _get_event(bd, clip_event)) {
++                        return 0;
++                    }
+                 }
+ 
+                 int r = _read_block(bd, st, bd->int_buf);
+@@ -2818,7 +2823,7 @@
+         return out_len;
+ }
+ 
+-static int _bd_read_locked(BLURAY *bd, unsigned char *buf, int len)
++static int _bd_read_locked(BLURAY *bd, unsigned char *buf, int len, BD_EVENT *clip_event)
+ {
+     BD_STREAM *st = &bd->st0;
+     int r;
+@@ -2837,7 +2842,7 @@
+ 
+     BD_DEBUG(DBG_STREAM, "Reading [%d bytes] at %" PRIu64 "...\n", len, bd->s_pos);
+ 
+-    r = _bd_read(bd, buf, len);
++    r = _bd_read(bd, buf, len, clip_event);
+     bd->pres_due = -1;
+ 
+     /* mark tracking */
+@@ -2853,7 +2858,7 @@
+     int result;
+ 
+     bd_mutex_lock(&bd->mutex);
+-    result = _bd_read_locked(bd, buf, len);
++    result = _bd_read_locked(bd, buf, len, NULL);
+     bd_mutex_unlock(&bd->mutex);
+ 
+     return result;
+@@ -4645,7 +4650,7 @@
+         }
+     }
+ 
+-    int bytes = _bd_read_locked(bd, buf, len);
++    int bytes = _bd_read_locked(bd, buf, len, bd->title_type == title_hdmv ? event : NULL);
+ 
+     if (bytes > 0) {
+         bd->pres_read = 1;
+@@ -4662,7 +4667,9 @@
+         }
+     }
+ 
+-    _get_event(bd, event);
++    if (event->event == BD_EVENT_NONE) {
++        _get_event(bd, event);
++    }
+ 
+     return bytes;
+ }
