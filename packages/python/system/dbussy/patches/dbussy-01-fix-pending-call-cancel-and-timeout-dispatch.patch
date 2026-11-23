@@ -1,0 +1,282 @@
+--- a/dbussy.py
++++ b/dbussy.py
+@@ -1850,6 +1850,7 @@
+ 
+     watches = [] # do I need to keep track of Watch objects?
+     timeouts = []
++    timeout_lock = threading.Lock()
+ 
+     def call_dispatch() :
+         status = dispatch()
+@@ -1919,23 +1920,80 @@
+         #end if
+     #end handle_remove_watch
+ 
+-    def handle_timeout(timeout) :
+-        if timeout["due"] != None and timeout["due"] <= loop.time() and timeout["timeout"].enabled :
+-            timeout["timeout"].handle()
++    def schedule_timeout(entry, gen) :
++        remaining = None
++        with timeout_lock :
++            if entry["gen"] == gen and entry["due"] != None :
++                remaining = max(0, entry["due"] - loop.time())
++            #end if
++        #end with
++        if remaining != None :
++            loop.call_later(remaining, handle_timeout, entry, gen)
++        #end if
++    #end schedule_timeout
++
++    def _schedule_timeout(entry, gen, delay) :
++        try :
++            running = asyncio.get_running_loop()
++        except RuntimeError :
++            running = None
++        #end try
++        if running is loop :
++            loop.call_later(delay, handle_timeout, entry, gen)
++        else :
++            try :
++                loop.call_soon_threadsafe(schedule_timeout, entry, gen)
++            except RuntimeError :
++                pass
++            #end try
++        #end if
++    #end _schedule_timeout
++
++    def handle_timeout(timeout, gen) :
++        reschedule = None
++        target = None
++        with timeout_lock :
++            if timeout["gen"] != gen or timeout["due"] == None :
++                return
++            #end if
++            if not timeout["timeout"].enabled :
++                return
++            #end if
++            remaining = timeout["due"] - loop.time()
++            if remaining > 0 :
++                reschedule = remaining
++            else :
++                target = timeout["timeout"]
++            #end if
++        #end with
++        if reschedule != None :
++            loop.call_later(reschedule, handle_timeout, timeout, gen)
++        elif target != None :
++            target.handle()
++            if dispatch != None :
++                call_dispatch()
++            #end if
+         #end if
+     #end handle_timeout
+ 
+     def handle_add_timeout(timeout, data) :
+-        if not any(timeout == t["timeout"] for t in timeouts) :
+-            entry = \
+-                {
+-                    "timeout" : timeout,
+-                    "due" : (lambda : None, lambda : loop.time() + timeout.interval)[timeout.enabled](),
+-                }
+-            timeouts.append(entry)
+-            if timeout.enabled :
+-                loop.call_later(timeout.interval, handle_timeout, entry)
++        delay = None
++        entry = None
++        with timeout_lock :
++            if not any(timeout == t["timeout"] for t in timeouts) :
++                enabled = timeout.enabled
++                delay = timeout.interval if enabled else None
++                entry = \
++                    {
++                        "timeout" : timeout,
++                        "due" : (loop.time() + delay) if enabled else None,
++                        "gen" : 0,
++                    }
++                timeouts.append(entry)
+             #end if
++        #end with
++        if delay != None :
++            _schedule_timeout(entry, 0, delay)
+         #end if
+         return \
+             True
+@@ -1945,34 +2003,41 @@
+         # not sure what to do if a Timeout gets toggled from enabled to disabled
+         # and then to enabled again; effectively I update the due time from
+         # the time of re-enabling.
+-        search = iter(timeouts)
+-        while True :
+-            entry = next(search, None)
+-            if entry == None :
+-                break
+-            #end if
+-            if entry["timeout"] == timeout :
+-                if timeout.enabled :
+-                    entry["due"] = loop.time() + timeout.enterval
+-                    loop.call_later(timeout.interval, handle_timeout, entry)
++        delay = None
++        scheduled = None
++        with timeout_lock :
++            for entry in timeouts :
++                if entry["timeout"] == timeout :
++                    entry["gen"] += 1
++                    if timeout.enabled :
++                        delay = timeout.interval
++                        entry["due"] = loop.time() + delay
++                        scheduled = (entry, entry["gen"])
++                    else :
++                        entry["due"] = None
++                    #end if
++                    break
++                #end if
++            #end for
++        #end with
++        if scheduled != None :
++            _schedule_timeout(scheduled[0], scheduled[1], delay)
++        #end if
++    #end handle_timeout_toggled
++
++    def handle_remove_timeout(timeout, data) :
++        with timeout_lock :
++            new_timeouts = []
++            for entry in timeouts :
++                if entry["timeout"] == timeout :
++                    entry["gen"] += 1
++                    entry["due"] = None # in case already queued, avoid segfault in handle_timeout
+                 else :
+-                    entry["due"] = None
++                    new_timeouts.append(entry)
+                 #end if
+-                break
+-            #end if
+-        #end while
+-    #end handle_timeout_toggled
+-
+-    def handle_remove_timeout(timeout, data) :
+-        new_timeouts = []
+-        for entry in timeouts :
+-            if entry["timeout"] == timeout :
+-                entry["due"] = None # in case already queued, avoid segfault in handle_timeout
+-            else :
+-                new_timeouts.append(entry)
+-            #end if
+-        #end for
+-        timeouts[:] = new_timeouts
++            #end for
++            timeouts[:] = new_timeouts
++        #end with
+     #end handle_remove_timeout
+ 
+ #begin _loop_attach
+@@ -4868,6 +4933,7 @@
+         "_wrap_notify",
+         "_wrap_free",
+         "_awaiting",
++        "_cancelled",
+       ) # to forestall typos
+ 
+     _instances = WeakValueDictionary()
+@@ -4881,6 +4947,7 @@
+             self._wrap_notify = None
+             self._wrap_free = None
+             self._awaiting = None
++            self._cancelled = False
+             celf._instances[_dbobj] = self
+         else :
+             dbus.dbus_pending_call_unref(self._dbobj)
+@@ -4892,6 +4959,14 @@
+ 
+     def __del__(self) :
+         if self._dbobj != None :
++            if self._wrap_notify != None or self._wrap_free != None :
++                if dbus.dbus_pending_call_get_completed(self._dbobj) == 0 :
++                    dbus.dbus_pending_call_cancel(self._dbobj)
++                #end if
++                dbus.dbus_pending_call_set_notify(self._dbobj, None, None, None)
++                self._wrap_notify = None
++                self._wrap_free = None
++            #end if
+             dbus.dbus_pending_call_unref(self._dbobj)
+             self._dbobj = None
+         #end if
+@@ -4914,22 +4989,25 @@
+ 
+     #begin set_notify
+         if function != None :
+-            self._wrap_notify = DBUS.PendingCallNotifyFunction(wrap_notify)
++            new_notify = DBUS.PendingCallNotifyFunction(wrap_notify)
+         else :
+-            self._wrap_notify = None
++            new_notify = None
+         #end if
+         if free_user_data != None :
+-            self._wrap_free = DBUS.FreeFunction(wrap_free)
++            new_free = DBUS.FreeFunction(wrap_free)
+         else :
+-            self._wrap_free = None
+-        #end if
+-        if not dbus.dbus_pending_call_set_notify(self._dbobj, self._wrap_notify, None, self._wrap_free) :
++            new_free = None
++        #end if
++        if not dbus.dbus_pending_call_set_notify(self._dbobj, new_notify, None, new_free) :
+             raise CallFailed("dbus_pending_call_set_notify")
+         #end if
++        self._wrap_notify = new_notify
++        self._wrap_free = new_free
+     #end set_notify
+ 
+     def cancel(self) :
+         "tells libdbus you no longer care about the pending incoming message."
++        self._cancelled = True
+         dbus.dbus_pending_call_cancel(self._dbobj)
+         if self._awaiting != None :
+             # This probably shouldn’t occur. Looking at the source of libdbus,
+@@ -4965,8 +5043,14 @@
+         conn = self._w_conn()
+         assert conn != None, "parent Connection has gone away"
+         assert conn.loop != None, "no event loop on parent Connection to attach coroutine to"
++        if self._cancelled :
++            raise asyncio.InvalidStateError("pending call has been cancelled")
++        #end if
+         if self._wrap_notify != None or self._awaiting != None :
+             raise asyncio.InvalidStateError("there is already a notify set on this PendingCall")
++        #end if
++        if self.completed :
++            return self.steal_reply()
+         #end if
+         done = conn.loop.create_future()
+         self._awaiting = done
+@@ -4981,11 +5065,27 @@
+             #end if
+         #end pending_done
+ 
+-        self.set_notify(pending_done, weak_ref(self))
+-          # avoid reference circularity self → pending_done → self
+-        reply = await done
+-        return \
+-            reply
++        try :
++            self.set_notify(pending_done, weak_ref(self))
++              # avoid reference circularity self → pending_done → self
++            if self.completed :
++                if done.done() :
++                    return done.result()
++                #end if
++                return self.steal_reply()
++            #end if
++            reply = await done
++            return \
++                reply
++        finally :
++            if not self.completed :
++                self.cancel()
++            #end if
++            if self._wrap_notify != None or self._wrap_free != None :
++                self.set_notify(None, None)
++            #end if
++            self._awaiting = None
++        #end try
+     #end await_reply
+ 
+     def block(self) :
