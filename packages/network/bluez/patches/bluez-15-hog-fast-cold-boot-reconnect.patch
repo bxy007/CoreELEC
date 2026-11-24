@@ -1,0 +1,1872 @@
+From: forbxy <forbxy@github.com>
+Date: Wed, 25 Nov 2026 00:35:00 +0800
+Subject: [PATCH] hog: persist static HID metadata for fast cold-boot reconnect
+
+BlueZ 5.78 caches GATT service/characteristic structure on disk, but does not
+persist static HoG metadata (Report Map 0x2A4B, HID Information 0x2A4A,
+Report Reference 0x2908, External Report Reference 0x2907). On the first
+reconnection after reboot, bluetoothd therefore runs dozens of serial ATT
+reads/writes before creating UHID and registering input notifications,
+blocking input readiness for ~2 seconds and dropping early keypresses.
+
+Persist those static read-only HoG attributes in a separate [AttributeValues]
+group in the existing GATT cache file (preserving full compatibility with
+[Attributes] and automatic invalidation on Service Changed / DB Hash change /
+cache clear / re-pairing). Force full characteristic/descriptor rediscovery
+of overlapping HID services on Service Changed or Database Hash mismatch so
+internal handle moves or metadata updates within the same handle range never
+reuse stale structure or values, and rebuild input-hog cleanly when any HID
+service is added or removed on multi-HID-service devices.
+
+On cached reconnection, create UHID after populating all report metadata and
+register input notification handlers immediately while verifying CCCD and
+protocol mode asynchronously in the background (including on warm reconnects
+with retained UHID). Only persist Report Map after UHID_START confirms kernel
+registration, and recover once via online read if a cached Report Map fails
+to reach UHID_START within timeout.
+
+Skip unused initial Report value reads on the gatt_db path, skip redundant
+CCCD writes when notifications are already enabled, buffer early input
+notifications until UHID_START provides numbered-report flags (discarding
+stale queued burst on overflow to prevent stuck keys), retain UHID and its
+callbacks across idle temporary disconnects for Bluetooth SIG Remote Control
+(GAP Appearance category 0x06) devices while forcing UHID destruction if an
+input report is still active on disconnect (preventing stuck keys / runaway
+key repeat), detach HoG and cancel in-flight GET/SET report ATT ops on service
+removal before attributes are freed, look up cached gatt_db attributes by
+handle+UUID, and keep bt_hog referenced across report_map_read_cb().
+---
+diff --git a/profiles/input/hog-lib.c b/profiles/input/hog-lib.c
+index 22599f7..9284c60 100644
+--- a/profiles/input/hog-lib.c
++++ b/profiles/input/hog-lib.c
+@@ -34,6 +34,7 @@
+ #include "src/shared/util.h"
+ #include "src/shared/uhid.h"
+ #include "src/shared/queue.h"
++#include "src/shared/timeout.h"
+ #include "src/shared/att.h"
+ #include "src/shared/gatt-db.h"
+ #include "src/log.h"
+@@ -66,6 +67,16 @@
+ 
+ #define HID_INFO_SIZE			4
+ #define ATT_NOTIFICATION_HEADER_SIZE	3
++#define HOG_MAX_PENDING_INPUT		64
++#ifndef HOG_UHID_START_TIMEOUT_MS
++#define HOG_UHID_START_TIMEOUT_MS	2000
++#endif
++
++struct pending_input {
++	struct report		*report;
++	uint16_t		len;
++	uint8_t			data[];
++};
+ 
+ struct bt_hog {
+ 	int			ref_count;
+@@ -96,19 +107,42 @@ struct bt_hog {
+ 	struct queue		*bas;
+ 	GSList			*instances;
+ 	struct queue		*gatt_op;
++	struct queue		*pending_input;
++	bool			pending_input_overflow;
++	unsigned int		uhid_start_id;
++	unsigned int		uhid_output_id;
++	unsigned int		uhid_getrep_id;
++	unsigned int		uhid_setrep_id;
++	unsigned int		uhid_start_timeout;
++	bool			uhid_from_cache;
++	bool			cache_recovery_tried;
++	uint8_t			*pending_report_map;
++	size_t			pending_report_map_len;
+ 	struct gatt_db		*gatt_db;
+-	struct gatt_db_attribute	*report_map_attr;
++	uint16_t		report_map_handle;
++	uint16_t		info_handle;
++	bool			info_pending;
++	unsigned int		ext_pending;
++	bool			has_external_reports;
++	bool			cache_dirty;
++	void			(*cache_updated_cb)(void *user_data);
++	void			*cache_updated_data;
+ };
+ 
+ struct report {
+ 	struct bt_hog		*hog;
+ 	bool			numbered;
++	bool			ref_known;
++	bool			ref_pending;
++	bool			ccc_read_queued;
++	bool			input_active;
+ 	uint8_t			id;
+ 	uint8_t			type;
+ 	uint16_t		handle;
+ 	uint16_t		value_handle;
+ 	uint8_t			properties;
+ 	uint16_t		ccc_handle;
++	uint16_t		ref_handle;
+ 	guint			notifyid;
+ 	uint16_t		len;
+ 	uint8_t			*value;
+@@ -152,6 +186,62 @@ static void destroy_gatt_req(void *data)
+ }
+ 
+ static void read_report_map(struct bt_hog *hog);
++static bool hog_try_create_uhid_from_cache(struct bt_hog *hog);
++
++static void db_cache_write_cb(struct gatt_db_attribute *attr, int err,
++							void *user_data)
++{
++	if (err)
++		error("Error writing cached HoG value to gatt db");
++}
++
++static void db_cache_read_cb(struct gatt_db_attribute *attrib, int err,
++					const uint8_t *value, size_t length,
++					void *user_data)
++{
++	struct iovec *iov = user_data;
++
++	if (err || !value || !length)
++		return;
++
++	iov->iov_base = (void *) value;
++	iov->iov_len = length;
++}
++
++static void hog_cache_write_attr(struct bt_hog *hog, uint16_t handle,
++				uint16_t uuid16, const uint8_t *data,
++				size_t len)
++{
++	struct gatt_db_attribute *attr;
++	const bt_uuid_t *type;
++	bt_uuid_t expected;
++
++	if (!hog->attrib || !hog->gatt_db || !handle || !data || !len)
++		return;
++
++	attr = gatt_db_get_attribute(hog->gatt_db, handle);
++	if (!attr)
++		return;
++
++	type = gatt_db_attribute_get_type(attr);
++	bt_uuid16_create(&expected, uuid16);
++	if (!type || bt_uuid_cmp(type, &expected) != 0)
++		return;
++
++	gatt_db_attribute_write(attr, 0, data, len, 0, NULL,
++						db_cache_write_cb, NULL);
++	hog->cache_dirty = true;
++}
++
++static void hog_notify_cache_updated(struct bt_hog *hog)
++{
++	if (!hog->cache_dirty)
++		return;
++
++	hog->cache_dirty = false;
++	if (hog->cache_updated_cb)
++		hog->cache_updated_cb(hog->cache_updated_data);
++}
+ 
+ static void remove_gatt_req(struct gatt_request *req, uint8_t status)
+ {
+@@ -159,13 +249,16 @@ static void remove_gatt_req(struct gatt_request *req, uint8_t status)
+ 
+ 	queue_remove(hog->gatt_op, req);
+ 
+-	if (!status && queue_isempty(hog->gatt_op)) {
++	if (!status && hog->attrib && queue_isempty(hog->gatt_op)) {
+ 		/* Report Map must be read last since that can result
+ 		 * in uhid being created and the driver may start to
+ 		 * use UHID_SET_REPORT which requires the report->id to
+ 		 * be known what attribute to send to.
+ 		 */
+-		read_report_map(hog);
++		if (!hog_try_create_uhid_from_cache(hog))
++			read_report_map(hog);
++		if (bt_uhid_started(hog->uhid))
++			hog_notify_cache_updated(hog);
+ 	}
+ 
+ 	destroy_gatt_req(req);
+@@ -320,6 +413,18 @@ static void find_included(struct bt_hog *hog, GAttrib *attrib,
+ 	}
+ }
+ 
++static bool report_payload_active(const uint8_t *data, size_t len)
++{
++	size_t i;
++
++	for (i = 0; i < len; i++) {
++		if (data[i] != 0)
++			return true;
++	}
++
++	return false;
++}
++
+ static void report_value_cb(const guint8 *pdu, guint16 len, gpointer user_data)
+ {
+ 	struct report *report = user_data;
+@@ -334,10 +439,33 @@ static void report_value_cb(const guint8 *pdu, guint16 len, gpointer user_data)
+ 	pdu += ATT_NOTIFICATION_HEADER_SIZE;
+ 	len -= ATT_NOTIFICATION_HEADER_SIZE;
+ 
++	if (!bt_uhid_started(hog->uhid)) {
++		if (hog->pending_input && !hog->pending_input_overflow) {
++			if (queue_length(hog->pending_input) >=
++							HOG_MAX_PENDING_INPUT) {
++				hog->pending_input_overflow = true;
++				queue_remove_all(hog->pending_input, NULL,
++								NULL, g_free);
++			} else {
++				struct pending_input *item;
++
++				item = g_malloc(sizeof(*item) + len);
++				item->report = report;
++				item->len = len;
++				if (len)
++					memcpy(item->data, pdu, len);
++				queue_push_tail(hog->pending_input, item);
++			}
++		}
++		return;
++	}
++
+ 	err = bt_uhid_input(hog->uhid, report->numbered ? report->id : 0, pdu,
+ 				len);
+ 	if (err < 0)
+ 		error("bt_uhid_input: %s (%d)", strerror(-err), -err);
++	else
++		report->input_active = report_payload_active(pdu, len);
+ }
+ 
+ static void report_notify_destroy(void *user_data)
+@@ -349,33 +477,57 @@ static void report_notify_destroy(void *user_data)
+ 	report->notifyid = 0;
+ }
+ 
+-static void report_ccc_written_cb(guint8 status, const guint8 *pdu,
+-					guint16 plen, gpointer user_data)
++static void hog_register_report_notify(struct report *report)
+ {
+-	struct gatt_request *req = user_data;
+-	struct report *report = req->user_data;
+ 	struct bt_hog *hog = report->hog;
+ 
+-	if (status != 0) {
+-		error("Write report characteristic descriptor failed: %s",
+-							att_ecode2str(status));
+-		goto remove;
+-	}
+-
+-	if (report->notifyid)
+-		goto remove;
++	if (!hog->attrib || report->notifyid ||
++		(report->ref_known && report->type != HOG_REPORT_TYPE_INPUT))
++		return;
+ 
+ 	report->notifyid = g_attrib_register(hog->attrib,
+ 					ATT_OP_HANDLE_NOTIFY,
+ 					report->value_handle,
+ 					report_value_cb, report,
+ 					report_notify_destroy);
+-	if (!report->notifyid) {
++	if (!report->notifyid)
+ 		error("Unable to register report notification: handle 0x%04x",
+ 					report->value_handle);
++}
++
++static void ccc_read_cb(guint8 status, const guint8 *pdu, guint16 len,
++							gpointer user_data);
++
++static void hog_subscribe_report(struct report *report)
++{
++	struct bt_hog *hog = report->hog;
++
++	if (!hog->attrib || report->type != HOG_REPORT_TYPE_INPUT)
++		return;
++
++	hog_register_report_notify(report);
++
++	if (report->ccc_handle && !report->ccc_read_queued) {
++		if (read_char(hog, hog->attrib, report->ccc_handle,
++							ccc_read_cb, report))
++			report->ccc_read_queued = true;
++	}
++}
++
++static void report_ccc_written_cb(guint8 status, const guint8 *pdu,
++					guint16 plen, gpointer user_data)
++{
++	struct gatt_request *req = user_data;
++	struct report *report = req->user_data;
++
++	if (status != 0) {
++		error("Write report characteristic descriptor failed: %s",
++							att_ecode2str(status));
+ 		goto remove;
+ 	}
+ 
++	hog_register_report_notify(report);
++
+ 	DBG("Report characteristic descriptor written: notifications enabled");
+ 
+ remove:
+@@ -399,11 +551,21 @@ static void ccc_read_cb(guint8 status, const guint8 *pdu, guint16 len,
+ 	struct gatt_request *req = user_data;
+ 	struct report *report = req->user_data;
+ 
++	report->ccc_read_queued = false;
++
+ 	if (status != 0) {
+ 		error("Error reading CCC value: %s", att_ecode2str(status));
+ 		goto remove;
+ 	}
+ 
++	if (!report->hog->attrib)
++		goto remove;
++
++	if (len >= 3 && (get_le16(&pdu[1]) & GATT_CLIENT_CHARAC_CFG_NOTIF_BIT)) {
++		hog_register_report_notify(report);
++		goto remove;
++	}
++
+ 	write_ccc(report->hog, report->hog->attrib, report->ccc_handle, report);
+ 
+ remove:
+@@ -430,6 +592,8 @@ static void report_reference_cb(guint8 status, const guint8 *pdu,
+ 	struct gatt_request *req = user_data;
+ 	struct report *report = req->user_data;
+ 
++	report->ref_pending = false;
++
+ 	if (status != 0) {
+ 		error("Read Report Reference descriptor failed: %s",
+ 							att_ecode2str(status));
+@@ -441,16 +605,28 @@ static void report_reference_cb(guint8 status, const guint8 *pdu,
+ 		goto remove;
+ 	}
+ 
++	if (!report->hog->attrib)
++		goto remove;
++
+ 	report->id = pdu[1];
+ 	report->type = pdu[2];
++	report->ref_known = true;
++
++	if (report->type >= HOG_REPORT_TYPE_INPUT &&
++				report->type <= HOG_REPORT_TYPE_FEATURE) {
++		uint8_t val[2] = { report->id, report->type };
++
++		hog_cache_write_attr(report->hog, report->ref_handle,
++					GATT_REPORT_REFERENCE, val,
++					sizeof(val));
++	}
+ 
+ 	DBG("Report 0x%04x: id 0x%02x type %s", report->value_handle,
+ 				report->id, type_to_string(report->type));
+ 
+ 	/* Enable notifications only for Input Reports */
+ 	if (report->type == HOG_REPORT_TYPE_INPUT)
+-		read_char(report->hog, report->hog->attrib, report->ccc_handle,
+-							ccc_read_cb, report);
++		hog_subscribe_report(report);
+ 
+ remove:
+ 	remove_gatt_req(req, status);
+@@ -475,7 +651,7 @@ static void discover_external_cb(uint8_t status, GSList *descs, void *user_data)
+ 
+ 		read_char(hog, hog->attrib, desc->handle,
+ 						external_report_reference_cb,
+-						hog);
++						NULL);
+ 	}
+ 
+ remove:
+@@ -634,10 +810,14 @@ static void external_report_reference_cb(guint8 status, const guint8 *pdu,
+ 					guint16 plen, gpointer user_data)
+ {
+ 	struct gatt_request *req = user_data;
+-	struct bt_hog *hog = req->user_data;
++	struct bt_hog *hog = req->hog;
++	uint16_t ext_handle = PTR_TO_UINT(req->user_data);
+ 	uint16_t uuid16;
+ 	bt_uuid_t uuid;
+ 
++	if (hog->ext_pending)
++		hog->ext_pending--;
++
+ 	if (status != 0) {
+ 		error("Read External Report Reference descriptor failed: %s",
+ 							att_ecode2str(status));
+@@ -649,6 +829,12 @@ static void external_report_reference_cb(guint8 status, const guint8 *pdu,
+ 		goto remove;
+ 	}
+ 
++	if (!hog->attrib)
++		goto remove;
++
++	hog_cache_write_attr(hog, ext_handle, GATT_EXTERNAL_REPORT_REFERENCE,
++								&pdu[1], 2);
++
+ 	uuid16 = get_le16(&pdu[1]);
+ 	DBG("External report reference read, external report characteristic "
+ 						"UUID: 0x%04x", uuid16);
+@@ -657,6 +843,7 @@ static void external_report_reference_cb(guint8 status, const guint8 *pdu,
+ 	if (uuid16 != HOG_REPORT_UUID)
+ 		goto remove;
+ 
++	hog->has_external_reports = true;
+ 	bt_uuid16_create(&uuid, uuid16);
+ 	discover_char(hog, hog->attrib, 0x0001, 0xffff, &uuid,
+ 					external_service_char_cb, hog);
+@@ -801,13 +988,47 @@ static void set_numbered(void *data, void *user_data)
+ static void start_flags(struct uhid_event *ev, void *user_data)
+ {
+ 	struct bt_hog *hog = user_data;
++	struct pending_input *item;
++
++	if (hog->uhid_start_timeout) {
++		timeout_remove(hog->uhid_start_timeout);
++		hog->uhid_start_timeout = 0;
++	}
+ 
++	hog->uhid_from_cache = false;
+ 	hog->uhid_flags = ev->u.start.dev_flags;
+ 
+ 	DBG("uHID device flags: 0x%16" PRIx64, hog->uhid_flags);
+ 
+ 	if (hog->uhid_flags)
+ 		g_slist_foreach(hog->reports, set_numbered, hog);
++
++	if (hog->pending_report_map) {
++		hog_cache_write_attr(hog, hog->report_map_handle,
++					HOG_REPORT_MAP_UUID,
++					hog->pending_report_map,
++					hog->pending_report_map_len);
++		free(hog->pending_report_map);
++		hog->pending_report_map = NULL;
++		hog->pending_report_map_len = 0;
++	}
++
++	hog_notify_cache_updated(hog);
++
++	hog->pending_input_overflow = false;
++
++	while (hog->pending_input &&
++			(item = queue_pop_head(hog->pending_input))) {
++		int err = bt_uhid_input(hog->uhid,
++				item->report->numbered ? item->report->id : 0,
++				item->data, item->len);
++		if (err < 0)
++			error("bt_uhid_input: %s (%d)", strerror(-err), -err);
++		else
++			item->report->input_active =
++				report_payload_active(item->data, item->len);
++		g_free(item);
++	}
+ }
+ 
+ static void set_report_cb(guint8 status, const guint8 *pdu,
+@@ -826,20 +1047,80 @@ static void set_report_cb(guint8 status, const guint8 *pdu,
+ 		error("bt_uhid_set_report_reply: %s", strerror(-err));
+ }
+ 
++static void set_report(struct uhid_event *ev, void *user_data);
++static void get_report(struct uhid_event *ev, void *user_data);
++
++static void uhid_register_callbacks(struct bt_hog *hog)
++{
++	if (!hog->uhid)
++		return;
++
++	if (!hog->uhid_start_id)
++		hog->uhid_start_id = bt_uhid_register(hog->uhid, UHID_START,
++							start_flags, hog);
++	if (!hog->uhid_output_id)
++		hog->uhid_output_id = bt_uhid_register(hog->uhid, UHID_OUTPUT,
++							forward_report, hog);
++	if (!hog->uhid_getrep_id)
++		hog->uhid_getrep_id = bt_uhid_register(hog->uhid,
++							UHID_GET_REPORT,
++							get_report, hog);
++	if (!hog->uhid_setrep_id)
++		hog->uhid_setrep_id = bt_uhid_register(hog->uhid,
++							UHID_SET_REPORT,
++							set_report, hog);
++}
++
++static void uhid_unregister_callbacks(struct bt_hog *hog, bool keep_start)
++{
++	if (!hog->uhid)
++		return;
++
++	if (!keep_start && hog->uhid_start_id) {
++		bt_uhid_unregister(hog->uhid, hog->uhid_start_id);
++		hog->uhid_start_id = 0;
++	}
++
++	if (hog->uhid_output_id) {
++		bt_uhid_unregister(hog->uhid, hog->uhid_output_id);
++		hog->uhid_output_id = 0;
++	}
++
++	if (hog->uhid_getrep_id) {
++		bt_uhid_unregister(hog->uhid, hog->uhid_getrep_id);
++		hog->uhid_getrep_id = 0;
++	}
++
++	if (hog->uhid_setrep_id) {
++		bt_uhid_unregister(hog->uhid, hog->uhid_setrep_id);
++		hog->uhid_setrep_id = 0;
++	}
++}
++
+ static void uhid_destroy(struct bt_hog *hog, bool force)
+ {
++	GSList *l;
+ 	int err;
+ 
+ 	if (!hog->uhid)
+ 		return;
+ 
+-	bt_uhid_unregister_all(hog->uhid);
+-
+ 	err = bt_uhid_destroy(hog->uhid, force);
+ 	if (err < 0) {
+ 		error("bt_uhid_destroy: %s", strerror(-err));
+ 		return;
+ 	}
++
++	if (!bt_uhid_created(hog->uhid)) {
++		hog->uhid_from_cache = false;
++		for (l = hog->reports; l; l = l->next) {
++			struct report *r = l->data;
++
++			r->input_active = false;
++		}
++	}
++
++	uhid_unregister_callbacks(hog, bt_uhid_created(hog->uhid));
+ }
+ 
+ static void set_report(struct uhid_event *ev, void *user_data)
+@@ -1013,68 +1294,63 @@ static void uhid_create(struct bt_hog *hog, uint8_t *report_map,
+ 		return;
+ 	}
+ 
+-	bt_uhid_register(hog->uhid, UHID_START, start_flags, hog);
+-	bt_uhid_register(hog->uhid, UHID_OUTPUT, forward_report, hog);
+-	bt_uhid_register(hog->uhid, UHID_GET_REPORT, get_report, hog);
+-	bt_uhid_register(hog->uhid, UHID_SET_REPORT, set_report, hog);
++	uhid_register_callbacks(hog);
+ 
+ 	DBG("HoG created uHID device");
+ }
+ 
+-static void db_report_map_write_value_cb(struct gatt_db_attribute *attr,
+-						int err, void *user_data)
+-{
+-	if (err)
+-		error("Error writing report map value to gatt db");
+-}
+-
+ static void report_map_read_cb(guint8 status, const guint8 *pdu, guint16 plen,
+ 							gpointer user_data)
+ {
+ 	struct gatt_request *req = user_data;
+-	struct bt_hog *hog = req->user_data;
+-	uint8_t *value;
++	struct bt_hog *hog = bt_hog_ref(req->hog);
++	uint8_t *value = NULL;
+ 	ssize_t vlen;
+ 
+-	remove_gatt_req(req, status);
+-
+ 	if (status != 0) {
+ 		error("Report Map read failed: %s", att_ecode2str(status));
+-		return;
++		goto remove;
+ 	}
+ 
++	if (!hog->attrib)
++		goto remove;
++
+ 	value = new0(uint8_t, plen);
+ 
+ 	vlen = dec_read_resp(pdu, plen, value, plen);
+ 	if (vlen < 0) {
+ 		error("ATT protocol error");
+-		goto done;
++		goto remove;
+ 	}
+ 
+ 	uhid_create(hog, value, vlen);
+ 
+-	/* Cache the report map if gatt_db is available  */
+-	if (hog->report_map_attr) {
+-		gatt_db_attribute_write(hog->report_map_attr, 0, value, vlen, 0,
+-					NULL, db_report_map_write_value_cb,
+-					NULL);
++	/* Defer persisting the Report Map until UHID_START confirms that the
++	 * kernel accepted and registered the HID descriptor.
++	 */
++	if (bt_uhid_created(hog->uhid) && vlen > 0 && hog->report_map_handle) {
++		free(hog->pending_report_map);
++		hog->pending_report_map = util_memdup(value, vlen);
++		hog->pending_report_map_len = hog->pending_report_map ? vlen : 0;
++		hog->uhid_from_cache = false;
+ 	}
+ 
+-done:
++remove:
++	remove_gatt_req(req, status);
++	hog->report_map_id = 0;
++	if (bt_uhid_started(hog->uhid))
++		hog_notify_cache_updated(hog);
+ 	free(value);
++	bt_hog_unref(hog);
+ }
+ 
+ static void read_report_map(struct bt_hog *hog)
+ {
+-	uint16_t handle;
+-
+-	if (!hog->report_map_attr || bt_uhid_created(hog->uhid) ||
+-			hog->report_map_id)
++	if (!hog->attrib || !hog->report_map_handle ||
++			bt_uhid_created(hog->uhid) || hog->report_map_id)
+ 		return;
+ 
+-	handle = gatt_db_attribute_get_handle(hog->report_map_attr);
+-
+-	hog->report_map_id = read_char(hog, hog->attrib, handle,
++	hog->report_map_id = read_char(hog, hog->attrib, hog->report_map_handle,
+ 						report_map_read_cb, hog);
+ }
+ 
+@@ -1086,12 +1362,17 @@ static void info_read_cb(guint8 status, const guint8 *pdu, guint16 plen,
+ 	uint8_t value[HID_INFO_SIZE];
+ 	ssize_t vlen;
+ 
++	hog->info_pending = false;
++
+ 	if (status != 0) {
+ 		error("HID Information read failed: %s",
+ 						att_ecode2str(status));
+ 		goto remove;
+ 	}
+ 
++	if (!hog->attrib)
++		goto remove;
++
+ 	vlen = dec_read_resp(pdu, plen, value, sizeof(value));
+ 	if (vlen != 4) {
+ 		error("ATT protocol error");
+@@ -1102,6 +1383,9 @@ static void info_read_cb(guint8 status, const guint8 *pdu, guint16 plen,
+ 	hog->bcountrycode = value[2];
+ 	hog->flags = value[3];
+ 
++	hog_cache_write_attr(hog, hog->info_handle, HOG_INFO_UUID,
++						value, sizeof(value));
++
+ 	DBG("bcdHID: 0x%04X bCountryCode: 0x%02X Flags: 0x%02X",
+ 			hog->bcdhid, hog->bcountrycode, hog->flags);
+ 
+@@ -1239,6 +1523,14 @@ static void hog_free(void *data)
+ 	bt_hog_detach(hog, true);
+ 	uhid_destroy(hog, true);
+ 
++	if (hog->uhid_start_timeout) {
++		timeout_remove(hog->uhid_start_timeout);
++		hog->uhid_start_timeout = 0;
++	}
++	free(hog->pending_report_map);
++	hog->pending_report_map = NULL;
++	hog->pending_report_map_len = 0;
++
+ 	queue_destroy(hog->bas, (void *) bt_bas_unref);
+ 	g_slist_free_full(hog->instances, hog_free);
+ 
+@@ -1249,6 +1541,7 @@ static void hog_free(void *data)
+ 	g_free(hog->name);
+ 	free(hog->primary);
+ 	queue_destroy(hog->gatt_op, (void *) destroy_gatt_req);
++	queue_destroy(hog->pending_input, g_free);
+ 	if (hog->gatt_db)
+ 		gatt_db_unref(hog->gatt_db);
+ 	g_free(hog);
+@@ -1274,8 +1567,29 @@ static void foreach_hog_report(struct gatt_db_attribute *attr, void *user_data)
+ 
+ 	bt_uuid16_create(&ref_uuid, GATT_REPORT_REFERENCE);
+ 	if (!bt_uuid_cmp(&ref_uuid, uuid)) {
+-		read_char(hog, hog->attrib, handle, report_reference_cb,
+-								report);
++		struct iovec cached = {};
++
++		report->ref_handle = handle;
++		if (report->ref_known)
++			return;
++
++		gatt_db_attribute_read(attr, 0, BT_ATT_OP_READ_REQ, NULL,
++						db_cache_read_cb, &cached);
++		if (cached.iov_len == 2) {
++			const uint8_t *val = cached.iov_base;
++
++			if (val[1] >= HOG_REPORT_TYPE_INPUT &&
++					val[1] <= HOG_REPORT_TYPE_FEATURE) {
++				report->id = val[0];
++				report->type = val[1];
++				report->ref_known = true;
++				return;
++			}
++		}
++
++		if (read_char(hog, hog->attrib, handle, report_reference_cb,
++								report))
++			report->ref_pending = true;
+ 		return;
+ 	}
+ 
+@@ -1313,9 +1627,6 @@ static struct report *report_add(struct bt_hog *hog,
+ 
+ 	hog->reports = g_slist_append(hog->reports, report);
+ 
+-	read_char(hog, hog->attrib, report->value_handle, report_read_cb,
+-								report);
+-
+ 	return report;
+ }
+ 
+@@ -1331,9 +1642,31 @@ static void foreach_hog_external(struct gatt_db_attribute *attr,
+ 	uuid = gatt_db_attribute_get_type(attr);
+ 
+ 	bt_uuid16_create(&ext_uuid, GATT_EXTERNAL_REPORT_REFERENCE);
+-	if (!bt_uuid_cmp(&ext_uuid, uuid))
+-		read_char(hog, hog->attrib, handle,
+-					external_report_reference_cb, hog);
++	if (!bt_uuid_cmp(&ext_uuid, uuid)) {
++		struct iovec cached = {};
++
++		gatt_db_attribute_read(attr, 0, BT_ATT_OP_READ_REQ, NULL,
++						db_cache_read_cb, &cached);
++		if (cached.iov_len == 2) {
++			uint16_t uuid16 = get_le16(cached.iov_base);
++
++			if (uuid16 == HOG_REPORT_UUID) {
++				bt_uuid_t r_uuid;
++
++				hog->has_external_reports = true;
++				bt_uuid16_create(&r_uuid, uuid16);
++				discover_char(hog, hog->attrib, 0x0001, 0xffff,
++						&r_uuid,
++						external_service_char_cb, hog);
++			}
++			return;
++		}
++
++		if (read_char(hog, hog->attrib, handle,
++					external_report_reference_cb,
++					UINT_TO_PTR(handle)))
++			hog->ext_pending++;
++	}
+ }
+ 
+ static void db_report_map_read_value_cb(struct gatt_db_attribute *attrib,
+@@ -1356,13 +1689,101 @@ static void db_report_map_read_value_cb(struct gatt_db_attribute *attrib,
+ 	map->iov_base = (void *) value;
+ }
+ 
++static bool hog_metadata_ready(struct bt_hog *hog)
++{
++	GSList *l;
++
++	if (hog->info_pending || hog->ext_pending)
++		return false;
++
++	if (hog->has_external_reports && !queue_isempty(hog->gatt_op))
++		return false;
++
++	for (l = hog->reports; l; l = l->next) {
++		struct report *r = l->data;
++
++		if (r->ref_pending)
++			return false;
++	}
++
++	return true;
++}
++
++static bool uhid_start_timeout_cb(void *user_data)
++{
++	struct bt_hog *hog = user_data;
++	struct gatt_db_attribute *attr;
++
++	hog->uhid_start_timeout = 0;
++
++	if (bt_uhid_started(hog->uhid) || !hog->uhid_from_cache ||
++			hog->cache_recovery_tried)
++		return false;
++
++	error("HoG cached Report Map failed to start UHID; retrying online");
++
++	hog->cache_recovery_tried = true;
++	hog->uhid_from_cache = false;
++
++	uhid_destroy(hog, true);
++
++	if (hog->gatt_db && hog->report_map_handle) {
++		attr = gatt_db_get_attribute(hog->gatt_db,
++						hog->report_map_handle);
++		if (attr) {
++			gatt_db_attribute_reset(attr);
++			hog->cache_dirty = true;
++			hog_notify_cache_updated(hog);
++		}
++	}
++
++	read_report_map(hog);
++
++	return false;
++}
++
++static bool hog_try_create_uhid_from_cache(struct bt_hog *hog)
++{
++	struct gatt_db_attribute *report_map_attr;
++	struct iovec map = {};
++
++	if (!hog->attrib || !hog->gatt_db || !hog->report_map_handle ||
++			bt_uhid_created(hog->uhid) || !hog_metadata_ready(hog))
++		return false;
++
++	report_map_attr = gatt_db_get_attribute(hog->gatt_db,
++						hog->report_map_handle);
++	if (!report_map_attr)
++		return false;
++
++	gatt_db_attribute_read(report_map_attr, 0, BT_ATT_OP_READ_REQ,
++				NULL, db_report_map_read_value_cb, &map);
++	if (!map.iov_len)
++		return false;
++
++	/* Report map and metadata found in the cache: create UHID immediately
++	 * after all reports are populated so reconnection does not block on
++	 * serial GATT reads.
++	 */
++	uhid_create(hog, map.iov_base, map.iov_len);
++	if (!bt_uhid_created(hog->uhid))
++		return false;
++
++	hog->uhid_from_cache = true;
++	if (!hog->cache_recovery_tried && !hog->uhid_start_timeout)
++		hog->uhid_start_timeout = timeout_add(HOG_UHID_START_TIMEOUT_MS,
++						uhid_start_timeout_cb, hog,
++						NULL);
++
++	return true;
++}
++
+ static void foreach_hog_chrc(struct gatt_db_attribute *attr, void *user_data)
+ {
+ 	struct bt_hog *hog = user_data;
+ 	bt_uuid_t uuid, report_uuid, report_map_uuid, info_uuid;
+ 	bt_uuid_t proto_mode_uuid, ctrlpt_uuid;
+ 	uint16_t handle, value_handle;
+-	struct iovec map = {};
+ 
+ 	gatt_db_attribute_get_char_data(attr, &handle, &value_handle, NULL,
+ 					NULL, &uuid);
+@@ -1376,31 +1797,38 @@ static void foreach_hog_chrc(struct gatt_db_attribute *attr, void *user_data)
+ 
+ 	bt_uuid16_create(&report_map_uuid, HOG_REPORT_MAP_UUID);
+ 	if (!bt_uuid_cmp(&report_map_uuid, &uuid)) {
+-
+-		if (hog->gatt_db) {
+-			/* Try to read the cache of report map if available */
+-			hog->report_map_attr = gatt_db_get_attribute(
+-								hog->gatt_db,
+-								value_handle);
+-			gatt_db_attribute_read(hog->report_map_attr, 0,
+-						BT_ATT_OP_READ_REQ, NULL,
+-						db_report_map_read_value_cb,
+-						&map);
+-		}
+-
+-		if (map.iov_len) {
+-			/* Report map found in the cache, straight to creating
+-			 * UHID to optimize reconnection.
+-			 */
+-			uhid_create(hog, map.iov_base, map.iov_len);
+-		}
++		hog->report_map_handle = value_handle;
+ 
+ 		gatt_db_service_foreach_desc(attr, foreach_hog_external, hog);
++		return;
+ 	}
+ 
+ 	bt_uuid16_create(&info_uuid, HOG_INFO_UUID);
+ 	if (!bt_uuid_cmp(&info_uuid, &uuid)) {
+-		read_char(hog, hog->attrib, value_handle, info_read_cb, hog);
++		struct gatt_db_attribute *info_attr;
++		struct iovec cached = {};
++
++		hog->info_handle = value_handle;
++		info_attr = hog->gatt_db ?
++			gatt_db_get_attribute(hog->gatt_db, value_handle) :
++			NULL;
++		if (info_attr) {
++			gatt_db_attribute_read(info_attr, 0,
++						BT_ATT_OP_READ_REQ, NULL,
++						db_cache_read_cb, &cached);
++			if (cached.iov_len == HID_INFO_SIZE) {
++				const uint8_t *val = cached.iov_base;
++
++				hog->bcdhid = get_le16(&val[0]);
++				hog->bcountrycode = val[2];
++				hog->flags = val[3];
++				return;
++			}
++		}
++
++		if (read_char(hog, hog->attrib, value_handle, info_read_cb,
++									hog))
++			hog->info_pending = true;
+ 		return;
+ 	}
+ 
+@@ -1439,11 +1867,12 @@ static struct bt_hog *hog_new(int fd, const char *name, uint16_t vendor,
+ 		return NULL;
+ 
+ 	hog->gatt_op = queue_new();
++	hog->pending_input = queue_new();
+ 	hog->bas = queue_new();
+ 	hog->uhid_fd = fd;
+ 	hog->uhid = uhid;
+ 
+-	if (!hog->gatt_op || !hog->bas) {
++	if (!hog->gatt_op || !hog->pending_input || !hog->bas) {
+ 		hog_free(hog);
+ 		return NULL;
+ 	}
+@@ -1474,9 +1903,26 @@ static void hog_attach_instance(struct bt_hog *hog,
+ 		return;
+ 
+ 	instance->gatt_db = gatt_db_ref(hog->gatt_db);
++	instance->cache_updated_cb = hog->cache_updated_cb;
++	instance->cache_updated_data = hog->cache_updated_data;
+ 	hog->instances = g_slist_append(hog->instances, bt_hog_ref(instance));
+ }
+ 
++void bt_hog_set_cache_updated_cb(struct bt_hog *hog,
++				void (*cb)(void *user_data), void *user_data)
++{
++	GSList *l;
++
++	if (!hog)
++		return;
++
++	hog->cache_updated_cb = cb;
++	hog->cache_updated_data = user_data;
++
++	for (l = hog->instances; l; l = l->next)
++		bt_hog_set_cache_updated_cb(l->data, cb, user_data);
++}
++
+ static void foreach_hog_service(struct gatt_db_attribute *attr, void *user_data)
+ {
+ 	struct bt_hog *hog = user_data;
+@@ -1692,6 +2138,7 @@ remove:
+ bool bt_hog_attach(struct bt_hog *hog, void *gatt)
+ {
+ 	GSList *l;
++	bool had_uhid;
+ 
+ 	if (hog->attrib)
+ 		return false;
+@@ -1717,38 +2164,67 @@ bool bt_hog_attach(struct bt_hog *hog, void *gatt)
+ 		bt_hog_attach(instance, gatt);
+ 	}
+ 
+-	if (!bt_uhid_created(hog->uhid)) {
++	had_uhid = bt_uhid_created(hog->uhid);
++
++	if (!had_uhid) {
+ 		DBG("HoG discovering characteristics");
+-		if (hog->attr)
++		if (hog->attr) {
+ 			gatt_db_service_foreach_char(hog->attr,
+ 							foreach_hog_chrc, hog);
+-		else
++			hog_try_create_uhid_from_cache(hog);
++			for (l = hog->reports; l; l = l->next) {
++				struct report *r = l->data;
++
++				if (r->ref_known &&
++						r->type == HOG_REPORT_TYPE_INPUT)
++					hog_subscribe_report(r);
++			}
++			if (!bt_uhid_created(hog->uhid) &&
++					queue_isempty(hog->gatt_op))
++				read_report_map(hog);
++		} else {
+ 			discover_char(hog, hog->attrib,
+ 					hog->primary->range.start,
+ 					hog->primary->range.end, NULL,
+ 					char_discovered_cb, hog);
++		}
+ 	}
+ 
+ 	if (!bt_uhid_created(hog->uhid))
+ 		return true;
+ 
+-	/* If UHID is already created, set up the report value handlers to
+-	 * optimize reconnection.
++	/* If UHID was retained across disconnect, restore UHID callbacks and
++	 * verify Protocol Mode / CCCD asynchronously without blocking input.
+ 	 */
+-	for (l = hog->reports; l; l = l->next) {
+-		struct report *r = l->data;
++	if (had_uhid) {
++		uhid_register_callbacks(hog);
++
++		if (!bt_uhid_started(hog->uhid) && hog->uhid_from_cache &&
++				!hog->cache_recovery_tried &&
++				!hog->uhid_start_timeout)
++			hog->uhid_start_timeout = timeout_add(
++						HOG_UHID_START_TIMEOUT_MS,
++						uhid_start_timeout_cb, hog,
++						NULL);
++
++		if (hog->proto_mode_handle)
++			read_char(hog, hog->attrib, hog->proto_mode_handle,
++						proto_mode_read_cb, hog);
+ 
+-		if (r->notifyid)
+-			continue;
++		for (l = hog->reports; l; l = l->next) {
++			struct report *r = l->data;
+ 
+-		r->notifyid = g_attrib_register(hog->attrib,
+-					ATT_OP_HANDLE_NOTIFY,
+-					r->value_handle,
+-					report_value_cb, r,
+-					report_notify_destroy);
+-		if (!r->notifyid)
+-			error("Unable to register report notification: "
+-				"handle 0x%04x", r->value_handle);
++			if (r->ref_known && r->type == HOG_REPORT_TYPE_INPUT)
++				hog_subscribe_report(r);
++			else
++				hog_register_report_notify(r);
++		}
++	} else {
++		for (l = hog->reports; l; l = l->next) {
++			struct report *r = l->data;
++
++			hog_register_report_notify(r);
++		}
+ 	}
+ 
+ 	/* Attempt to replay get/set report messages since the driver might not
+@@ -1759,13 +2235,43 @@ bool bt_hog_attach(struct bt_hog *hog, void *gatt)
+ 	return true;
+ }
+ 
++static bool hog_has_active_input(struct bt_hog *hog)
++{
++	GSList *l;
++
++	for (l = hog->reports; l; l = l->next) {
++		struct report *r = l->data;
++
++		if (r->input_active)
++			return true;
++	}
++
++	return false;
++}
++
+ void bt_hog_detach(struct bt_hog *hog, bool force)
+ {
+ 	GSList *l;
++	bool destroy_force;
+ 
+ 	if (!hog)
+ 		return;
+ 
++	/* Never retain UHID if an input report is still active (e.g. key held
++	 * down across link loss); destroying UHID lets the kernel synthesize
++	 * clean key releases and stops client key-repeat timers.
++	 */
++	destroy_force = force || hog_has_active_input(hog);
++
++	if (hog->uhid_start_timeout) {
++		timeout_remove(hog->uhid_start_timeout);
++		hog->uhid_start_timeout = 0;
++	}
++
++	free(hog->pending_report_map);
++	hog->pending_report_map = NULL;
++	hog->pending_report_map_len = 0;
++
+ 	if (!hog->attrib)
+ 		goto done;
+ 
+@@ -1784,6 +2290,8 @@ void bt_hog_detach(struct bt_hog *hog, bool force)
+ 			g_attrib_unregister(hog->attrib, r->notifyid);
+ 			r->notifyid = 0;
+ 		}
++		r->ref_pending = false;
++		r->ccc_read_queued = false;
+ 	}
+ 
+ 	if (hog->scpp)
+@@ -1792,12 +2300,28 @@ void bt_hog_detach(struct bt_hog *hog, bool force)
+ 	if (hog->dis)
+ 		bt_dis_detach(hog->dis);
+ 
++	if (hog->getrep_att) {
++		g_attrib_cancel(hog->attrib, hog->getrep_att);
++		hog->getrep_att = 0;
++	}
++
++	if (hog->setrep_att) {
++		g_attrib_cancel(hog->attrib, hog->setrep_att);
++		hog->setrep_att = 0;
++	}
++
+ 	queue_remove_all(hog->gatt_op, cancel_gatt_req, hog, destroy_gatt_req);
++	queue_remove_all(hog->pending_input, NULL, NULL, g_free);
++	hog->pending_input_overflow = false;
++	hog->report_map_id = 0;
++	hog->info_pending = false;
++	hog->ext_pending = 0;
++	hog->has_external_reports = false;
+ 	g_attrib_unref(hog->attrib);
+ 	hog->attrib = NULL;
+ 
+ done:
+-	uhid_destroy(hog, force);
++	uhid_destroy(hog, destroy_force);
+ }
+ 
+ int bt_hog_set_control_point(struct bt_hog *hog, bool suspend)
+diff --git a/profiles/input/hog-lib.h b/profiles/input/hog-lib.h
+index 41e4546..4926678 100644
+--- a/profiles/input/hog-lib.h
++++ b/profiles/input/hog-lib.h
+@@ -24,5 +24,8 @@ void bt_hog_unref(struct bt_hog *hog);
+ bool bt_hog_attach(struct bt_hog *hog, void *gatt);
+ void bt_hog_detach(struct bt_hog *hog, bool force);
+ 
++void bt_hog_set_cache_updated_cb(struct bt_hog *hog,
++				void (*cb)(void *user_data), void *user_data);
++
+ int bt_hog_set_control_point(struct bt_hog *hog, bool suspend);
+ int bt_hog_send_report(struct bt_hog *hog, void *data, size_t size, int type);
+diff --git a/profiles/input/hog.c b/profiles/input/hog.c
+index bc1b89e..950645d 100644
+--- a/profiles/input/hog.c
++++ b/profiles/input/hog.c
+@@ -62,6 +62,13 @@ void input_set_auto_sec(bool state)
+ 	auto_sec = state;
+ }
+ 
++static void hog_cache_updated(void *user_data)
++{
++	struct hog_device *dev = user_data;
++
++	btd_device_store_gatt_db(dev->device);
++}
++
+ static void hog_device_accept(struct hog_device *dev, struct gatt_db *db)
+ {
+ 	char name[248];
+@@ -79,11 +86,23 @@ static void hog_device_accept(struct hog_device *dev, struct gatt_db *db)
+ 	product = btd_device_get_product(dev->device);
+ 	version = btd_device_get_version(dev->device);
+ 	type = bt_uhid_icon_to_type(btd_device_get_icon(dev->device));
++	if (type == BT_UHID_NONE) {
++		uint16_t appearance = 0;
++
++		/* Treat Bluetooth SIG Remote Control (category 0x06) like a
++		 * keyboard for UHID retention across temporary disconnects.
++		 */
++		if (device_get_appearance(dev->device, &appearance) == 0 &&
++				((appearance & 0xffc0) >> 6) == 0x06)
++			type = BT_UHID_KEYBOARD;
++	}
+ 
+ 	DBG("name=%s vendor=0x%X, product=0x%X, version=0x%X", name, vendor,
+ 							product, version);
+ 
+ 	dev->hog = bt_hog_new_default(name, vendor, product, version, type, db);
++	if (dev->hog)
++		bt_hog_set_cache_updated_cb(dev->hog, hog_cache_updated, dev);
+ }
+ 
+ static struct hog_device *hog_device_new(struct btd_device *device)
+@@ -111,6 +130,11 @@ static void hog_device_free(void *data)
+ 		devices = NULL;
+ 	}
+ 
++	if (dev->hog) {
++		bt_hog_set_cache_updated_cb(dev->hog, NULL, NULL);
++		bt_hog_detach(dev->hog, true);
++	}
++
+ 	btd_device_unref(dev->device);
+ 	bt_hog_unref(dev->hog);
+ 	free(dev);
+diff --git a/src/device.c b/src/device.c
+index 0f18c8c..26f5cab 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -2800,6 +2800,15 @@ static void store_gatt_db(struct btd_device *device)
+ 	btd_settings_gatt_db_store(device->db, filename);
+ }
+ 
++void btd_device_store_gatt_db(struct btd_device *device)
++{
++	if (!device || !bt_gatt_client_is_ready(device->client) ||
++						gatt_db_isempty(device->db))
++		return;
++
++	store_gatt_db(device);
++}
++
+ static void browse_request_complete(struct browse_req *req, uint8_t type,
+ 						uint8_t bdaddr_type, int err)
+ {
+@@ -4126,6 +4135,45 @@ static gboolean gatt_services_changed(gpointer user_data)
+ 	return FALSE;
+ }
+ 
++static bool is_hog_service(struct gatt_db_attribute *attr)
++{
++	bt_uuid_t uuid, hog_uuid;
++
++	if (!attr)
++		return false;
++
++	gatt_db_attribute_get_service_uuid(attr, &uuid);
++	bt_uuid16_create(&hog_uuid, 0x1812);
++
++	return bt_uuid_cmp(&uuid, &hog_uuid) == 0;
++}
++
++static void first_active_hog_cb(struct gatt_db_attribute *attr,
++							void *user_data)
++{
++	struct gatt_db_attribute **found = user_data;
++
++	if (*found)
++		return;
++
++	if (gatt_db_service_get_active(attr))
++		*found = attr;
++}
++
++static struct gatt_db_attribute *find_active_hog_service(struct gatt_db *db)
++{
++	struct gatt_db_attribute *found = NULL;
++	bt_uuid_t hog_uuid;
++
++	if (!db)
++		return NULL;
++
++	bt_uuid16_create(&hog_uuid, 0x1812);
++	gatt_db_foreach_service(db, &hog_uuid, first_active_hog_cb, &found);
++
++	return found;
++}
++
+ static void gatt_service_added(struct gatt_db_attribute *attr, void *user_data)
+ {
+ 	struct btd_device *device = user_data;
+@@ -4149,6 +4197,12 @@ static void gatt_service_added(struct gatt_db_attribute *attr, void *user_data)
+ 
+ 	device_register_primaries(device, new_service, -1);
+ 
++	/* input-hog aggregates all 0x1812 services of a device into one bt_hog
++	 * instance list; rebuild it whenever another HID service is added.
++	 */
++	if (is_hog_service(attr))
++		device_remove_gatt_service(device, attr);
++
+ 	add_gatt_service(attr, device);
+ 
+ 	btd_gatt_client_service_added(device->client_dbus, attr);
+@@ -4227,13 +4281,29 @@ static void gatt_service_removed(struct gatt_db_attribute *attr,
+ 		 * However, if the device is marked as temporary, then we
+ 		 * remove it anyway.
+ 		 */
+-		if (device->client || device->temporary == TRUE)
++		if (device->client || device->temporary == TRUE ||
++							is_hog_service(attr))
+ 			device_remove_gatt_service(device, attr);
+ 
+ 		g_free(l->data);
+ 		device->uuids = g_slist_delete_link(device->uuids, l);
+ 		g_dbus_emit_property_changed(dbus_conn, device->path,
+ 						DEVICE_INTERFACE, "UUIDs");
++	} else if (is_hog_service(attr)) {
++		struct gatt_db_attribute *rem_svc;
++
++		/* Always tear down input-hog before the removed HID service's
++		 * attributes are freed, then rebuild for surviving HID services.
++		 */
++		device_remove_gatt_service(device, attr);
++		rem_svc = find_active_hog_service(device->db);
++		if (rem_svc && !device->blocked) {
++			if (device->attrib &&
++					bt_gatt_client_is_ready(device->client))
++				add_gatt_service(rem_svc, device);
++			else
++				btd_device_add_uuid(device, prim->uuid);
++		}
+ 	}
+ 
+ 	g_free(prim);
+@@ -5500,11 +5570,144 @@ static void gatt_client_ready_cb(bool success, uint8_t att_ecode,
+ 	store_gatt_db(device);
+ }
+ 
++#define HOG_SVC_UUID16		0x1812
++#define HOG_INFO_UUID16		0x2A4A
++#define HOG_REPORT_MAP_UUID16	0x2A4B
++
++struct hog_inval_data {
++	struct btd_device *device;
++	uint16_t start_handle;
++	uint16_t end_handle;
++	bool invalidated;
++	struct gatt_db_attribute *matched_svc;
++};
++
++static void hog_inval_read_cb(struct gatt_db_attribute *attrib, int err,
++				const uint8_t *value, size_t length,
++				void *user_data)
++{
++	bool *has_value = user_data;
++
++	if (!err && value && length > 0)
++		*has_value = true;
++}
++
++static bool hog_reset_cached_attr(struct gatt_db_attribute *attr)
++{
++	bool has_value = false;
++
++	if (!attr)
++		return false;
++
++	gatt_db_attribute_read(attr, 0, BT_ATT_OP_READ_REQ, NULL,
++					hog_inval_read_cb, &has_value);
++	if (!has_value)
++		return false;
++
++	gatt_db_attribute_reset(attr);
++	return true;
++}
++
++static void invalidate_hog_desc_cb(struct gatt_db_attribute *attr,
++							void *user_data)
++{
++	struct hog_inval_data *data = user_data;
++	const bt_uuid_t *uuid;
++	bt_uuid_t ref_uuid, ext_uuid;
++
++	uuid = gatt_db_attribute_get_type(attr);
++	if (!uuid)
++		return;
++
++	bt_uuid16_create(&ref_uuid, GATT_REPORT_REFERENCE);
++	bt_uuid16_create(&ext_uuid, GATT_EXTERNAL_REPORT_REFERENCE);
++
++	if (!bt_uuid_cmp(uuid, &ref_uuid) || !bt_uuid_cmp(uuid, &ext_uuid)) {
++		if (hog_reset_cached_attr(attr))
++			data->invalidated = true;
++	}
++}
++
++static void invalidate_hog_chrc_cb(struct gatt_db_attribute *attr,
++							void *user_data)
++{
++	struct hog_inval_data *data = user_data;
++	uint16_t value_handle;
++	bt_uuid_t uuid, info_uuid, map_uuid;
++
++	if (!gatt_db_attribute_get_char_data(attr, NULL, &value_handle,
++						NULL, NULL, &uuid))
++		return;
++
++	bt_uuid16_create(&info_uuid, HOG_INFO_UUID16);
++	bt_uuid16_create(&map_uuid, HOG_REPORT_MAP_UUID16);
++
++	if (!bt_uuid_cmp(&uuid, &info_uuid) || !bt_uuid_cmp(&uuid, &map_uuid)) {
++		struct gatt_db_attribute *val_attr;
++
++		val_attr = gatt_db_get_attribute(data->device->db,
++								value_handle);
++		if (hog_reset_cached_attr(val_attr))
++			data->invalidated = true;
++	}
++
++	gatt_db_service_foreach_desc(attr, invalidate_hog_desc_cb, data);
++}
++
++static void invalidate_hog_service_cb(struct gatt_db_attribute *svc,
++							void *user_data)
++{
++	struct hog_inval_data *data = user_data;
++	uint16_t svc_start = 0, svc_end = 0;
++
++	if (!gatt_db_attribute_get_service_handles(svc, &svc_start, &svc_end))
++		return;
++
++	if (svc_end < data->start_handle || svc_start > data->end_handle)
++		return;
++
++	data->matched_svc = svc;
++	gatt_db_service_foreach_char(svc, invalidate_hog_chrc_cb, data);
++}
++
+ static void gatt_client_service_changed(uint16_t start_handle,
+ 							uint16_t end_handle,
+ 							void *user_data)
+ {
++	struct btd_device *device = user_data;
++	struct hog_inval_data data = {
++		.device = device,
++		.start_handle = start_handle,
++		.end_handle = end_handle,
++	};
++	bt_uuid_t hog_uuid;
++
+ 	DBG("start 0x%04x, end: 0x%04x", start_handle, end_handle);
++
++	if (!device || !device->db)
++		return;
++
++	bt_uuid16_create(&hog_uuid, HOG_SVC_UUID16);
++	gatt_db_foreach_service(device->db, &hog_uuid,
++					invalidate_hog_service_cb, &data);
++
++	if (!data.invalidated || !data.matched_svc)
++		return;
++
++	store_gatt_db(device);
++	device_remove_gatt_service(device, data.matched_svc);
++
++	if (device->blocked)
++		return;
++
++	if (device->attrib) {
++		add_gatt_service(data.matched_svc, device);
++	} else {
++		char uuid_str[MAX_LEN_UUID_STR];
++
++		bt_uuid_to_string(&hog_uuid, uuid_str, sizeof(uuid_str));
++		btd_device_add_uuid(device, uuid_str);
++	}
+ }
+ 
+ static void gatt_debug(const char *str, void *user_data)
+diff --git a/src/device.h b/src/device.h
+index 9753677..fc9b645 100644
+--- a/src/device.h
++++ b/src/device.h
+@@ -67,6 +67,7 @@ struct gatt_primary *btd_device_get_primary(struct btd_device *device,
+ GSList *btd_device_get_primaries(struct btd_device *device);
+ struct gatt_db *btd_device_get_gatt_db(struct btd_device *device);
+ bool btd_device_set_gatt_db(struct btd_device *device, struct gatt_db *db);
++void btd_device_store_gatt_db(struct btd_device *device);
+ struct bt_gatt_client *btd_device_get_gatt_client(struct btd_device *device);
+ struct bt_gatt_server *btd_device_get_gatt_server(struct btd_device *device);
+ bool btd_device_is_initiator(struct btd_device *device);
+diff --git a/src/settings.c b/src/settings.c
+index 3716493..bb9a8fb 100644
+--- a/src/settings.c
++++ b/src/settings.c
+@@ -13,6 +13,7 @@
+ 
+ #include <stdbool.h>
+ #include <errno.h>
++#include <string.h>
+ 
+ #include <glib.h>
+ 
+@@ -30,6 +31,83 @@
+ #define GATT_INCLUDE_UUID_STR "2802"
+ #define GATT_CHARAC_UUID_STR "2803"
+ 
++#define HOG_SVC_UUID16		0x1812
++#define HOG_INFO_UUID16		0x2A4A
++#define HOG_REPORT_MAP_UUID16	0x2A4B
++#define HOG_REPORT_MAP_MAX_LEN	4096
++
++struct attr_value_data {
++	const uint8_t *data;
++	size_t len;
++};
++
++static bool hog_attr_value_limits(const bt_uuid_t *uuid, size_t *min_len,
++					size_t *max_len, bool *is_report_ref)
++{
++	bt_uuid_t u;
++
++	*is_report_ref = false;
++
++	bt_uuid16_create(&u, HOG_INFO_UUID16);
++	if (!bt_uuid_cmp(uuid, &u)) {
++		*min_len = 4;
++		*max_len = 4;
++		return true;
++	}
++
++	bt_uuid16_create(&u, HOG_REPORT_MAP_UUID16);
++	if (!bt_uuid_cmp(uuid, &u)) {
++		*min_len = 1;
++		*max_len = HOG_REPORT_MAP_MAX_LEN;
++		return true;
++	}
++
++	bt_uuid16_create(&u, GATT_EXTERNAL_REPORT_REFERENCE);
++	if (!bt_uuid_cmp(uuid, &u)) {
++		*min_len = 2;
++		*max_len = 2;
++		return true;
++	}
++
++	bt_uuid16_create(&u, GATT_REPORT_REFERENCE);
++	if (!bt_uuid_cmp(uuid, &u)) {
++		*min_len = 2;
++		*max_len = 2;
++		*is_report_ref = true;
++		return true;
++	}
++
++	return false;
++}
++
++static bool attr_in_hog_service(struct gatt_db *db, uint16_t handle)
++{
++	struct gatt_db_attribute *svc;
++	bt_uuid_t svc_uuid, hog_uuid;
++
++	svc = gatt_db_get_service(db, handle);
++	if (!svc)
++		return false;
++
++	gatt_db_attribute_get_service_uuid(svc, &svc_uuid);
++	bt_uuid16_create(&hog_uuid, HOG_SVC_UUID16);
++
++	return bt_uuid_cmp(&svc_uuid, &hog_uuid) == 0;
++}
++
++static void attr_value_read_cb(struct gatt_db_attribute *attrib,
++						int err, const uint8_t *value,
++						size_t length, void *user_data)
++{
++	struct attr_value_data *out = user_data;
++
++	if (err || !value || !length)
++		return;
++
++	out->data = value;
++	out->len = length;
++}
++
+ static ssize_t str2val(const char *str, uint8_t *val, size_t len)
+ {
+ 	const char *pos = str;
+@@ -306,6 +384,87 @@ static int gatt_db_load(struct gatt_db *db, GKeyFile *key_file, char **keys)
+ 	return 0;
+ }
+ 
++static void load_attr_values(struct gatt_db *db, GKeyFile *key_file)
++{
++	char **keys, **k;
++
++	keys = g_key_file_get_keys(key_file, "AttributeValues", NULL, NULL);
++	if (!keys)
++		return;
++
++	for (k = keys; *k; k++) {
++		struct gatt_db_attribute *att;
++		const bt_uuid_t *uuid;
++		uint16_t handle_int;
++		size_t min_len, max_len, hex_len, byte_len, i;
++		bool is_report_ref;
++		char *hex;
++		uint8_t *buf;
++		bool ok = true;
++
++		if (strlen(*k) != 4 ||
++				!g_ascii_isxdigit((*k)[0]) ||
++				!g_ascii_isxdigit((*k)[1]) ||
++				!g_ascii_isxdigit((*k)[2]) ||
++				!g_ascii_isxdigit((*k)[3]) ||
++				sscanf(*k, "%04hx", &handle_int) != 1)
++			continue;
++
++		if (!attr_in_hog_service(db, handle_int))
++			continue;
++
++		att = gatt_db_get_attribute(db, handle_int);
++		if (!att)
++			continue;
++
++		uuid = gatt_db_attribute_get_type(att);
++		if (!uuid || !hog_attr_value_limits(uuid, &min_len, &max_len,
++							&is_report_ref))
++			continue;
++
++		hex = g_key_file_get_string(key_file, "AttributeValues", *k,
++									NULL);
++		if (!hex)
++			continue;
++
++		hex_len = strlen(hex);
++		if (!hex_len || (hex_len % 2) != 0) {
++			g_free(hex);
++			continue;
++		}
++
++		byte_len = hex_len / 2;
++		if (byte_len < min_len || byte_len > max_len) {
++			g_free(hex);
++			continue;
++		}
++
++		buf = g_malloc(byte_len);
++		for (i = 0; i < byte_len; i++) {
++			int hi = g_ascii_xdigit_value(hex[i * 2]);
++			int lo = g_ascii_xdigit_value(hex[i * 2 + 1]);
++
++			if (hi < 0 || lo < 0) {
++				ok = false;
++				break;
++			}
++			buf[i] = (uint8_t)((hi << 4) | lo);
++		}
++
++		if (ok && is_report_ref && (buf[1] < 1 || buf[1] > 3))
++			ok = false;
++
++		if (ok)
++			gatt_db_attribute_write(att, 0, buf, byte_len, 0, NULL,
++							load_desc_value, NULL);
++
++		g_free(buf);
++		g_free(hex);
++	}
++
++	g_strfreev(keys);
++}
++
+ int btd_settings_gatt_db_load(struct gatt_db *db, const char *filename)
+ {
+ 	char **keys;
+@@ -328,6 +487,8 @@ int btd_settings_gatt_db_load(struct gatt_db *db, const char *filename)
+ 	}
+ 
+ 	err = gatt_db_load(db, key_file, keys);
++	if (!err)
++		load_attr_values(db, key_file);
+ 
+ 	g_strfreev(keys);
+ 	g_key_file_free(key_file);
+@@ -353,6 +514,45 @@ static void db_hash_read_value_cb(struct gatt_db_attribute *attrib,
+ 	*hash = value;
+ }
+ 
++static void store_attr_value(struct gatt_saver *saver,
++				struct gatt_db_attribute *attr,
++				const bt_uuid_t *uuid)
++{
++	struct attr_value_data val = {};
++	size_t min_len, max_len, i;
++	bool is_report_ref;
++	uint16_t handle_num;
++	char handle[6];
++	char *hex;
++
++	if (!attr || !uuid)
++		return;
++
++	handle_num = gatt_db_attribute_get_handle(attr);
++	if (!handle_num || !attr_in_hog_service(saver->db, handle_num))
++		return;
++
++	if (!hog_attr_value_limits(uuid, &min_len, &max_len, &is_report_ref))
++		return;
++
++	gatt_db_attribute_read(attr, 0, BT_ATT_OP_READ_REQ, NULL,
++					attr_value_read_cb, &val);
++	if (!val.data || val.len < min_len || val.len > max_len)
++		return;
++
++	if (is_report_ref && (val.data[1] < 1 || val.data[1] > 3))
++		return;
++
++	hex = g_malloc(val.len * 2 + 1);
++	for (i = 0; i < val.len; i++)
++		sprintf(&hex[i * 2], "%02x", val.data[i]);
++	hex[val.len * 2] = '\0';
++
++	sprintf(handle, "%04hx", handle_num);
++	g_key_file_set_string(saver->key_file, "AttributeValues", handle, hex);
++	g_free(hex);
++}
++
+ static void store_desc(struct gatt_db_attribute *attr, void *user_data)
+ {
+ 	struct gatt_saver *saver = user_data;
+@@ -375,12 +575,15 @@ static void store_desc(struct gatt_db_attribute *attr, void *user_data)
+ 		sprintf(value, "%s", uuid_str);
+ 
+ 	g_key_file_set_string(key_file, "Attributes", handle, value);
++
++	store_attr_value(saver, attr, uuid);
+ }
+ 
+ static void store_chrc(struct gatt_db_attribute *attr, void *user_data)
+ {
+ 	struct gatt_saver *saver = user_data;
+ 	GKeyFile *key_file = saver->key_file;
++	struct gatt_db_attribute *val_attr;
+ 	char handle[6], value[100], uuid_str[MAX_LEN_UUID_STR];
+ 	uint16_t handle_num, value_handle;
+ 	uint8_t properties;
+@@ -401,9 +604,9 @@ static void store_chrc(struct gatt_db_attribute *attr, void *user_data)
+ 	if (!bt_uuid_cmp(&uuid, &hash_uuid)) {
+ 		const uint8_t *hash = NULL;
+ 
+-		attr = gatt_db_get_attribute(saver->db, value_handle);
++		val_attr = gatt_db_get_attribute(saver->db, value_handle);
+ 
+-		gatt_db_attribute_read(attr, 0, BT_ATT_OP_READ_REQ, NULL,
++		gatt_db_attribute_read(val_attr, 0, BT_ATT_OP_READ_REQ, NULL,
+ 					db_hash_read_value_cb, &hash);
+ 		if (hash)
+ 			sprintf(value, GATT_CHARAC_UUID_STR ":%04hx:%02hhx:"
+@@ -425,6 +628,9 @@ static void store_chrc(struct gatt_db_attribute *attr, void *user_data)
+ 
+ 	g_key_file_set_string(key_file, "Attributes", handle, value);
+ 
++	val_attr = gatt_db_get_attribute(saver->db, value_handle);
++	store_attr_value(saver, val_attr, &uuid);
++
+ 	gatt_db_service_foreach_desc(attr, store_desc, saver);
+ }
+ 
+@@ -508,6 +714,7 @@ void btd_settings_gatt_db_store(struct gatt_db *db, const char *filename)
+ 
+ 	/* Remove current attributes since it might have changed */
+ 	g_key_file_remove_group(key_file, "Attributes", NULL);
++	g_key_file_remove_group(key_file, "AttributeValues", NULL);
+ 
+ 	saver.key_file = key_file;
+ 	saver.db = db;
+diff --git a/src/shared/gatt-client.c b/src/shared/gatt-client.c
+index ab3e0ae..1a830b6 100644
+--- a/src/shared/gatt-client.c
++++ b/src/shared/gatt-client.c
+@@ -1429,6 +1429,67 @@ static void discover_all(struct discovery_op *op)
+ 	discovery_op_unref(op);
+ }
+ 
++#define HOG_SVC_UUID16 0x1812
++
++struct hog_sc_collect {
++	uint16_t orig_start;
++	uint16_t orig_end;
++	uint16_t disc_start;
++	uint16_t disc_end;
++	struct queue *services;
++};
++
++static void collect_overlapping_hog(struct gatt_db_attribute *svc,
++							void *user_data)
++{
++	struct hog_sc_collect *data = user_data;
++	uint16_t svc_start = 0, svc_end = 0;
++
++	if (!gatt_db_attribute_get_service_handles(svc, &svc_start, &svc_end))
++		return;
++
++	if (svc_end < data->orig_start || svc_start > data->orig_end)
++		return;
++
++	if (svc_start < data->disc_start)
++		data->disc_start = svc_start;
++	if (svc_end > data->disc_end)
++		data->disc_end = svc_end;
++
++	queue_push_tail(data->services, svc);
++}
++
++static void clear_changed_hog_services(struct gatt_db *db,
++					uint16_t *start_handle,
++					uint16_t *end_handle)
++{
++	struct hog_sc_collect data;
++	struct gatt_db_attribute *svc;
++	bt_uuid_t hog_uuid;
++
++	if (!db)
++		return;
++
++	data.orig_start = *start_handle;
++	data.orig_end = *end_handle;
++	data.disc_start = *start_handle;
++	data.disc_end = *end_handle;
++	data.services = queue_new();
++	if (!data.services)
++		return;
++
++	bt_uuid16_create(&hog_uuid, HOG_SVC_UUID16);
++	gatt_db_foreach_service(db, &hog_uuid, collect_overlapping_hog, &data);
++
++	while ((svc = queue_pop_head(data.services)))
++		gatt_db_remove_service(db, svc);
++
++	queue_destroy(data.services, NULL);
++
++	*start_handle = data.disc_start;
++	*end_handle = data.disc_end;
++}
++
+ static void db_hash_write_value_cb(struct gatt_db_attribute *attrib,
+ 						int err, void *user_data)
+ {
+@@ -1494,6 +1555,11 @@ static void db_hash_read_cb(bool success, uint8_t att_ecode,
+ 
+ discover:
+ 	if (!op->success) {
++		if (hash) {
++			uint16_t s = 0x0001, e = 0xffff;
++
++			clear_changed_hog_services(client->db, &s, &e);
++		}
+ 		discover_all(op);
+ 		return;
+ 	}
+@@ -1942,6 +2008,12 @@ static void process_service_changed(struct bt_gatt_client *client,
+ {
+ 	struct discovery_op *op;
+ 
++	/* Force full rediscovery of overlapping HID services so internal handle
++	 * moves or Report Map/Reference updates within the same service range
++	 * never reuse stale cached structure or metadata.
++	 */
++	clear_changed_hog_services(client->db, &start_handle, &end_handle);
++
+ 	op = discovery_op_create(client, start_handle, end_handle,
+ 						service_changed_complete,
+ 						service_changed_failure);
