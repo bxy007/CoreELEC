@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: avdvplus <dev@coreelec.org>
+Date: Wed, 25 Nov 2026 02:13:00 +0800
+Subject: [PATCH] avformat: add read-only avformat_peek_buffered_packets()
+
+Allow callers (such as Kodi's initial HEVC HDR probe) to non-destructively
+inspect packets already queued in AVFormatContext's internal packet_buffer
+(for example by avformat_find_stream_info()) without performing any I/O or
+mutating demuxer/AVIO state.
+---
+ libavformat/avformat.h | 17 +++++++++++++++++
+ libavformat/demux.c    | 20 ++++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/libavformat/avformat.h b/libavformat/avformat.h
+index 99b7eb4..a5d1c1e 100644
+--- a/libavformat/avformat.h
++++ b/libavformat/avformat.h
+@@ -2292,6 +2292,23 @@
+  */
+ int av_read_frame(AVFormatContext *s, AVPacket *pkt);
+ 
++#define AVFORMAT_HAS_PEEK_BUFFERED_PACKETS 1
++/**
++ * Non-destructively inspect packets already buffered inside the format context
++ * (for example, packets queued by avformat_find_stream_info()) without
++ * performing I/O or mutating demuxer/AVIO state.
++ *
++ * Calls cb(opaque, pkt) for each buffered packet in FIFO order and stops early
++ * if cb returns non-zero.
++ *
++ * @param s      media file handle
++ * @param cb     callback invoked for each buffered packet
++ * @param opaque user pointer forwarded to cb
++ * @return number of buffered packets visited (0 if none or invalid arguments)
++ */
++int avformat_peek_buffered_packets(const AVFormatContext *s,
++                                   int (*cb)(void *opaque, const AVPacket *pkt),
++                                   void *opaque);
+ /**
+  * Seek to the keyframe at timestamp.
+  * 'timestamp' in 'stream_index'.
+diff --git a/libavformat/demux.c b/libavformat/demux.c
+index 13c7d9d..f30f27a 100644
+--- a/libavformat/demux.c
++++ b/libavformat/demux.c
+@@ -1680,6 +1680,26 @@ return_packet:
+     return ret;
+ }
+ 
++int avformat_peek_buffered_packets(const AVFormatContext *s,
++                                   int (*cb)(void *opaque, const AVPacket *pkt),
++                                   void *opaque)
++{
++    const FFFormatContext *si;
++    const PacketListEntry *pktl;
++    int visited = 0;
++
++    if (!s || !cb)
++        return 0;
++
++    si = (const FFFormatContext *)s;
++    for (pktl = si->packet_buffer.head; pktl; pktl = pktl->next) {
++        visited++;
++        if (cb(opaque, &pktl->pkt) != 0)
++            break;
++    }
++    return visited;
++}
++
+ /**
+  * Return TRUE if the stream has accurate duration in any stream.
+  *
+-- 
+2.43.0
